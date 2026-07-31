@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm import LLM, SamplingParams
+from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import ShardedStateLoader
 from vllm.platforms import current_platform
 from vllm.transformers_utils.repo_utils import hf_api
@@ -48,6 +49,41 @@ def test_filter_subtensors():
     for key, tensor in filtered_state_dict.items():
         # NOTE: don't use `equal` here, as the tensor might contain NaNs
         assert tensor is state_dict[key]
+
+
+def _touch_shards(directory, pattern, tp_size, parts=2):
+    for rank in range(tp_size):
+        for part in range(parts):
+            name = pattern.format(rank=rank, part=part)
+            open(os.path.join(directory, name), "w").close()
+
+
+@pytest.mark.parametrize("pattern", [None, "custom-{rank}-{part}.safetensors"])
+def test_saved_tp_size_counts_ranks(pattern):
+    extra_config = {"pattern": pattern} if pattern else None
+    loader = ShardedStateLoader(
+        LoadConfig(load_format="sharded_state", model_loader_extra_config=extra_config)
+    )
+    with TemporaryDirectory() as directory:
+        _touch_shards(directory, loader.pattern, tp_size=4)
+        open(os.path.join(directory, "config.json"), "w").close()
+        assert loader._saved_tp_size(directory) == 4
+
+
+def test_saved_tp_size_returns_none_when_undeterminable():
+    loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    with TemporaryDirectory() as directory:
+        assert loader._saved_tp_size(directory) is None
+
+    rankless = ShardedStateLoader(
+        LoadConfig(
+            load_format="sharded_state",
+            model_loader_extra_config={"pattern": "model-part-{part}.safetensors"},
+        )
+    )
+    with TemporaryDirectory() as directory:
+        open(os.path.join(directory, "model-part-0.safetensors"), "w").close()
+        assert rankless._saved_tp_size(directory) is None
 
 
 @pytest.fixture(scope="module")
