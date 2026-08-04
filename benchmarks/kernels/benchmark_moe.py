@@ -93,6 +93,32 @@ class BenchmarkConfig(TypedDict):
     num_stages: int
 
 
+def _moe_quant_dtypes(
+    use_fp8_w8a8: bool, use_int8_w8a16: bool, use_int4_w4a16: bool
+) -> tuple[torch.dtype | str | None, torch.dtype | str | None]:
+    """Activation and weight dtypes for `FusedMoEQuantConfig.make`.
+
+    `quant_dtype` is the ACTIVATION type. The w8a16 and w4a16 modes leave it
+    unset and declare only the weight side; setting it configures w8a8 and
+    makes the kernel read 16-bit activations as int8.
+
+    Args:
+        use_fp8_w8a8: fp8 weights and fp8 activations.
+        use_int8_w8a16: int8 weights, 16-bit activations.
+        use_int4_w4a16: int4 weights, 16-bit activations.
+
+    Returns:
+        The `(quant_dtype, weight_dtype)` pair.
+    """
+    if use_fp8_w8a8:
+        return torch.float8_e4m3fn, None
+    if use_int8_w8a16:
+        return None, torch.int8
+    if use_int4_w4a16:
+        return None, "int4"
+    return None, None
+
+
 def benchmark_config(
     config: BenchmarkConfig,
     num_tokens: int,
@@ -226,12 +252,9 @@ def benchmark_config(
     def run():
         from vllm.model_executor.layers.fused_moe import override_config
 
-        if use_fp8_w8a8:
-            quant_dtype = torch.float8_e4m3fn
-        elif use_int8_w8a16:
-            quant_dtype = torch.int8
-        else:
-            quant_dtype = None
+        quant_dtype, weight_dtype = _moe_quant_dtypes(
+            use_fp8_w8a8, use_int8_w8a16, use_int4_w4a16
+        )
 
         quant_config = FusedMoEQuantConfig.make(
             quant_dtype=quant_dtype,
@@ -240,7 +263,7 @@ def benchmark_config(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_quant_shape,
-            weight_dtype="int4" if use_int4_w4a16 else None,
+            weight_dtype=weight_dtype,
         )
 
         deep_gemm_experts = None
