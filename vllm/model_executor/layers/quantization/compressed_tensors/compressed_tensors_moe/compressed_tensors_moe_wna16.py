@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticGroupScale,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -593,6 +594,48 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                     4,
                     existing=getattr(layer, "workspace", None),
                 )
+
+        # ROCm int4 only: repack from K-packed (E, N, K // 2) uint8 to N-packed
+        # (E, K, N // 8) int32, so the Triton kernel unpacks with three
+        # tl.interleave and constant shifts instead of loading each packed byte
+        # twice with per-element variable shifts.
+        #
+        # Upstream vllm-project/vllm#43389 restricts this to on_gfx1x() (RDNA).
+        # Widened to GFX9 here after measuring on 2x MI210 (gfx90a): output is
+        # bit-identical to the scalar-shift path and fused_moe_kernel_gptq_awq
+        # is 1.45x-4.8x faster (rocprofv3, median of 160 launches, M=1..128,
+        # both fp16 and bf16).
+        #
+        # Gated on TRITON: convert_to_wna16_moe_kernel_format() only leaves the
+        # (E, N, K // 2) uint8 layout this consumes when that backend was
+        # chosen. Repacking a Marlin or FlashInfer layout would not raise -- it
+        # would silently produce wrong weights.
+        if (
+            self.wna16_backend == WNA16MoEBackend.TRITON
+            and self.num_bits == 4
+            and current_platform.is_rocm()
+        ):
+            from vllm.platforms.rocm import on_gfx1x, on_gfx9
+
+            if on_gfx1x() or on_gfx9():
+                from vllm.model_executor.layers.quantization.utils.moe_wna16_utils import (  # noqa: E501
+                    repack_int4_to_int32,
+                )
+
+                # All known int4 MoE models have N divisible by 8. Skip
+                # gracefully otherwise and keep the scalar-shift kernel.
+                for w_attr, s_attr in (
+                    ("w13_weight_packed", "w13_weight_scale"),
+                    ("w2_weight_packed", "w2_weight_scale"),
+                ):
+                    w = getattr(layer, w_attr)
+                    if w.data.shape[1] % 8 != 0:
+                        continue
+                    replace_parameter(layer, w_attr, repack_int4_to_int32(w.data))
+                    sc = getattr(layer, s_attr)
+                    replace_parameter(
+                        layer, s_attr, sc.data.permute(0, 2, 1).contiguous()
+                    )
 
         # Alias packed weights to w13_weight/w2_weight for the modular kernel interface
         layer.w13_weight = layer.w13_weight_packed
