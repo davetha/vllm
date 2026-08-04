@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import shutil
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -84,6 +85,63 @@ def test_saved_tp_size_returns_none_when_undeterminable():
     with TemporaryDirectory() as directory:
         open(os.path.join(directory, "model-part-0.safetensors"), "w").close()
         assert rankless._saved_tp_size(directory) is None
+
+
+def _model_config_stub(directory):
+    """Minimal stand-in for ModelConfig.
+
+    load_weights() reads exactly two attributes before the guard fires, and
+    building a real ModelConfig would require a downloadable model for a check
+    that never gets as far as looking at one.
+    """
+    return SimpleNamespace(model=directory, model_weights=None)
+
+
+@pytest.mark.parametrize("saved_tp_size, running_tp_size", [(4, 2), (2, 4)])
+def test_load_weights_rejects_tp_mismatch(monkeypatch, saved_tp_size, running_tp_size):
+    """The shrinking direction is the one that used to corrupt silently.
+
+    Saved at TP=4 and served at TP=2, every rank finds files that are half the
+    size of its parameters, load_weights() narrows each one, the missing-keys
+    check at the end passes, and the model serves with half of every tensor
+    uninitialized. The only signal was a per-tensor logger.warning.
+    """
+    import vllm.distributed as dist
+
+    loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    with TemporaryDirectory() as directory:
+        _touch_shards(directory, loader.pattern, tp_size=saved_tp_size)
+        monkeypatch.setattr(
+            dist, "get_tensor_model_parallel_world_size", lambda: running_tp_size
+        )
+        with pytest.raises(ValueError) as excinfo:
+            loader.load_weights(torch.nn.Module(), _model_config_stub(directory))
+
+    message = str(excinfo.value)
+    assert f"tensor_parallel_size={saved_tp_size}" in message
+    assert f"tensor_parallel_size={running_tp_size}" in message
+
+
+def test_load_weights_allows_matching_tp(monkeypatch):
+    """The guard must not fire when the sizes agree.
+
+    The load still fails afterwards -- these are empty placeholder files, not
+    real safetensors -- so this asserts on which failure is reached, which is
+    what distinguishes "guard passed" from "guard fired".
+    """
+    import vllm.distributed as dist
+
+    loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    with TemporaryDirectory() as directory:
+        _touch_shards(directory, loader.pattern, tp_size=2)
+        monkeypatch.setattr(dist, "get_tensor_model_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(dist, "get_tensor_model_parallel_rank", lambda: 0)
+        with pytest.raises(Exception) as excinfo:
+            loader.load_weights(torch.nn.Module(), _model_config_stub(directory))
+
+    assert "Sharded checkpoint" not in str(excinfo.value), (
+        "TP guard fired on a checkpoint whose size matches the running instance"
+    )
 
 
 @pytest.fixture(scope="module")
