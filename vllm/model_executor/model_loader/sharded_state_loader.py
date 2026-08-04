@@ -4,6 +4,7 @@
 import collections
 import glob
 import os
+import re
 import time
 from collections.abc import Generator
 from copy import copy
@@ -107,13 +108,58 @@ class ShardedStateLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model, model_config.revision)
 
+    def _saved_tp_size(self, local_model_path: str) -> int | None:
+        """Infer the tensor parallel size a sharded checkpoint was saved with.
+
+        Args:
+            local_model_path: Directory or S3 prefix holding the checkpoint.
+
+        Returns:
+            The number of distinct ranks present, or `None` if the configured
+            pattern has no rank field or no matching files were found.
+        """
+        if "{rank}" not in self.pattern:
+            return None
+        name_re = re.compile(
+            re.escape(self.pattern)
+            .replace(re.escape("{rank}"), r"(\d+)")
+            .replace(re.escape("{part}"), r"\d+")
+        )
+        any_rank = self.pattern.format(rank="*", part="*")
+        if is_s3(local_model_path):
+            paths = s3_glob(path=local_model_path, allow_pattern=[f"*{any_rank}"])
+        else:
+            paths = glob.glob(os.path.join(local_model_path, any_rank))
+        ranks = {
+            int(m.group(1))
+            for p in paths
+            if (m := name_re.fullmatch(os.path.basename(p)))
+        }
+        return len(ranks) or None
+
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
 
         model_weights = model_config.model
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
         local_model_path = model_weights
+
+        # Without this, a rank whose shard is smaller than its parameter is
+        # narrowed and partially filled below, leaving the model silently
+        # half-initialized rather than failing.
+        tp_size = get_tensor_model_parallel_world_size()
+        saved_tp_size = self._saved_tp_size(local_model_path)
+        if saved_tp_size is not None and saved_tp_size != tp_size:
+            raise ValueError(
+                f"Sharded checkpoint at '{local_model_path}' was saved with "
+                f"tensor_parallel_size={saved_tp_size}, but this instance has "
+                f"tensor_parallel_size={tp_size}. Sharded checkpoints cannot be "
+                f"resharded; re-save it with tensor_parallel_size={tp_size}."
+            )
 
         rank = get_tensor_model_parallel_rank()
         pattern = os.path.join(
