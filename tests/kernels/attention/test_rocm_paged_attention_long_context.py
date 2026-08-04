@@ -237,3 +237,44 @@ def test_gfx90a_declines_large_block_sizes(block_size: int) -> None:
     assert _gate_accepts(65_536, torch.bfloat16, block_size=16), (
         "gate should still admit the standard block size"
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(), reason="ROCm-only paged attention kernel"
+)
+def test_free_kernel_head_size_rule() -> None:
+    """The free kernel needs head_size % (16 * NWARPS) == 0.
+
+    ``vheloop = head_size / 16 / NWARPS`` uses integer division and bounds every
+    loop over the V head dimension, so a remainder is left unaccumulated.
+    Measured on MI210: the number of head elements matching the reference is
+    exactly ``vheloop * 64`` -- 0 of 32, 64 of 96, 128 of 160, and exact for
+    64/128/192/256.
+
+    NWARPS is ``256 / WARP_SIZE``, so the requirement is a multiple of 64 on
+    GFX9 and 128 on wave32 parts.
+    """
+    from vllm.platforms.rocm import (
+        _FREE_KERNEL_HEAD_MULTIPLE,
+        _rocm_free_paged_attention_ok,
+        _uses_rocm_free_paged_attention,
+        on_gfx9,
+    )
+
+    assert _FREE_KERNEL_HEAD_MULTIPLE == (64 if on_gfx9() else 128)
+
+    # Shapes the template-specialized kernel handles are never affected.
+    for head_size in (64, 128):
+        for block_size in (16, 32):
+            assert not _uses_rocm_free_paged_attention(head_size, block_size)
+            assert _rocm_free_paged_attention_ok(head_size, block_size)
+
+    # Anything else lands on the free kernel and must satisfy the multiple.
+    for head_size in (64, 128, 192, 256):
+        assert _uses_rocm_free_paged_attention(head_size, block_size=64)
+        expected = head_size % _FREE_KERNEL_HEAD_MULTIPLE == 0
+        assert _rocm_free_paged_attention_ok(head_size, block_size=64) is expected
+
+    # Sizes the reference disagrees with are rejected on every architecture.
+    for head_size in (32, 96, 160):
+        assert not _rocm_free_paged_attention_ok(head_size, block_size=16)
