@@ -342,6 +342,41 @@ if (
     os.environ["HIP_ONLINE_TUNING"] = "1"
 
 
+# The ROCm "free" paged-attention kernel (runtime head_size/block_size) computes
+#     vheloop = head_size / 16 / NWARPS,   NWARPS = NUM_THREADS / WARP_SIZE
+# with plain integer division, and that bounds every loop over the V head
+# dimension. NUM_THREADS is 256 and WARP_SIZE is 64 on GFX9, 32 elsewhere, so a
+# head_size that is not a multiple of 16 * NWARPS silently leaves the remainder
+# of the V dimension unaccumulated.
+#
+# Measured on MI210 (gfx90a, NWARPS=4, multiple of 64): the number of head
+# elements that match the reference is exactly vheloop * 64 --
+#   head_size  32 ->   0 of  32 correct
+#   head_size  96 ->  64 of  96 correct
+#   head_size 160 -> 128 of 160 correct
+# and 64/128/192/256 are exact. On wave32 parts NWARPS is 8, so the requirement
+# is a multiple of 128; that half is derived from the arithmetic above and has
+# not been measured.
+_FREE_KERNEL_HEAD_MULTIPLE = 16 * (256 // (64 if _ON_GFX9 else 32))
+
+
+def _uses_rocm_free_paged_attention(head_size: int, block_size: int) -> bool:
+    """Whether a shape falls through to the free kernel.
+
+    The launcher switches on head_size first and then block_size, taking the
+    template-specialized kernel only for head_size in {64, 128} together with
+    block_size in {16, 32}; anything else lands on the free kernel.
+    """
+    return head_size not in (64, 128) or block_size not in (16, 32)
+
+
+def _rocm_free_paged_attention_ok(head_size: int, block_size: int) -> bool:
+    """False when the free kernel would drop part of the V dimension."""
+    if not _uses_rocm_free_paged_attention(head_size, block_size):
+        return True
+    return head_size % _FREE_KERNEL_HEAD_MULTIPLE == 0
+
+
 @cache
 def use_rocm_custom_paged_attention(
     qtype: torch.dtype,
@@ -356,18 +391,51 @@ def use_rocm_custom_paged_attention(
 ) -> bool:
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
+    # The free kernel (runtime head_size/block_size) handles any combination not
+    # covered by the template-specialized non-free kernels.
     if _ON_GFX9:
+        # Non-free kernel: head_size in {64,128} and block_size in {16,32}.
+        # Free kernel: any head_size in {64,128,192,256} and any block_size.
         return (
             (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
-            and (head_size == 64 or head_size == 128)
-            and (block_size == 16 or block_size == 32)
+            and head_size in (64, 128, 192, 256)
+            # See _FREE_KERNEL_HEAD_MULTIPLE: the free kernel drops part of the
+            # V dimension when head_size is not a multiple of 16 * NWARPS. On
+            # GFX9 every head_size above already satisfies this, so nothing
+            # changes here; on wave32 parts it excludes 64 and 192.
+            and _rocm_free_paged_attention_ok(head_size, block_size)
+            # The free kernel returns incorrect results on gfx90a (CDNA2) for
+            # block_size > 64. Measured on MI210 against the reference: every
+            # free-kernel case with block_size in {128, 512, 1024, 2096}
+            # mismatches by order 1, while 16/32/64 agree at every head size
+            # this gate admits.
+            # This matters because hybrid models choose large blocks on their
+            # own -- attention is aligned to the mamba page size, giving 544
+            # for Qwen3-Next -- so without this they are silently admitted
+            # rather than routed to Triton as get_supported_kernel_block_sizes
+            # documents.
+            # Restricted to gfx90a: untested on gfx942/gfx950.
+            and (block_size <= 64 or not _ON_GFX90A)
             and (gqa_ratio >= 1 and gqa_ratio <= 16)
-            and max_seq_len <= 128 * 1024
             and sinks is None
         )
-
+    elif _ON_GFX12X:
+        # Non-free kernel: head_size=128 and block_size=16.
+        # Free kernel: any head_size in {64,128,192,256} and any block_size.
+        return (
+            (sliding_window == 0 or sliding_window == (-1, -1))
+            and (qtype == torch.half or qtype == torch.bfloat16)
+            and head_size in (64, 128, 192, 256)
+            and _rocm_free_paged_attention_ok(head_size, block_size)
+            and (gqa_ratio >= 1 and gqa_ratio <= 16)
+            and alibi_slopes is None
+            and kv_cache_dtype == "auto"
+            and sinks is None
+        )
     else:
+        # GFX11: only the template-specialized non-free kernel
+        # (head_size=128, block_size=16).
         return (
             _ON_GFX1X
             and (sliding_window == 0 or sliding_window == (-1, -1))
@@ -375,7 +443,6 @@ def use_rocm_custom_paged_attention(
             and head_size == 128
             and block_size == 16
             and (gqa_ratio >= 3 and gqa_ratio <= 16)
-            and max_seq_len <= 128 * 1024
             and alibi_slopes is None
             and kv_cache_dtype == "auto"
             and sinks is None
