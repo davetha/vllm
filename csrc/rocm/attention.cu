@@ -4364,16 +4364,46 @@ void paged_attention_custom_launcher(
     case 8:
       LAUNCH_CUSTOM_REDUCTION(8);
       break;
+    // Cases 9..16 keep 131,072 < seq_len <= 262,144 on the direct
+    // single-pass path, skipping both the extra pass launches and the
+    // merge kernel. The template body is unchanged and is already
+    // instantiated at 16 by the Navi launcher below; at WARP_SIZE=64 this
+    // costs 4 KB of LDS and ~48 VGPRs, well inside gfx90a limits.
+    case 9:
+      LAUNCH_CUSTOM_REDUCTION(9);
+      break;
+    case 10:
+      LAUNCH_CUSTOM_REDUCTION(10);
+      break;
+    case 11:
+      LAUNCH_CUSTOM_REDUCTION(11);
+      break;
+    case 12:
+      LAUNCH_CUSTOM_REDUCTION(12);
+      break;
+    case 13:
+      LAUNCH_CUSTOM_REDUCTION(13);
+      break;
+    case 14:
+      LAUNCH_CUSTOM_REDUCTION(14);
+      break;
+    case 15:
+      LAUNCH_CUSTOM_REDUCTION(15);
+      break;
+    case 16:
+      LAUNCH_CUSTOM_REDUCTION(16);
+      break;
     default:
-      // For npar_loops > 8, perform multiple reductions with 8 loops each.
-      // GFX9 hardware has a hard limit of 8 npar_loops per reduction kernel.
-      // This corresponds to processing 8 * WARP_SIZE (512) partitions per pass.
-      // For sequences longer than 128K tokens (which require ~512 partitions at 256-tok/partition),
-      // we split the work into multiple passes:
-      //   - Each pass outputs float4 (value, exp_sum, max_logit, pad) for intermediate results
-      //   - A final merge kernel combines these using log-sum-exp for numerical stability
+      // For npar_loops > 16, perform multiple reductions with 8 loops each,
+      // processing 8 * WARP_SIZE (512) partitions per pass:
+      //   - Each pass outputs float4 (value, exp_sum, max_logit, pad)
+      //   - A merge kernel combines them with log-sum-exp for stability
       //   - This allows unlimited sequence length via multiple passes
-      if (npar_loops > 8) {
+      // The cases above stop at 16 because that is where the fully-unrolled
+      // reduction stops being cheap: NPAR_LOOPS sizes one shared array and
+      // three register arrays, so at WARP_SIZE=64 case 16 costs 4 KB of LDS
+      // and ~48 VGPRs, while 64 would need 16 KB and ~192.
+      if (npar_loops > 16) {
         const int num_passes = (npar_loops + 7) / 8;
         const int partitions_per_pass = 8 * WARP_SIZE;  // 8 npar_loops * 64 warp_size
         for (int pass = 0; pass < num_passes; ++pass) {
@@ -4395,7 +4425,7 @@ void paged_attention_custom_launcher(
   // This merge kernel combines them into the final output using the stable log-sum-exp formula:
   //   result = value_1 + exp_sum_1 * (value_2 / exp_sum_1 + ...)
   // This ensures numerical stability when merging attention weights from multiple passes.
-  if (npar_loops > 8) {
+  if (npar_loops > 16) {
     const int num_passes = (npar_loops + 7) / 8;
     paged_attention_merge_reduce_kernel<T, OUTT>
         <<<reduce_grid, reduce_block, 0, stream>>>(

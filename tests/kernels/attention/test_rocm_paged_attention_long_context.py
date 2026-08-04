@@ -21,13 +21,12 @@ The gate is asserted to *accept* before each comparison. Without that a declined
 gate sends both arms to Triton, they agree perfectly, and a broken kernel looks
 flawless.
 
-Pass structure, from the launcher: ``npar_loops <= 8`` runs the single-pass
-switch that already shipped. Above that,
-``num_passes = ceil(npar_loops / 8)``, each pass covering
-``8 * WARP_SIZE * PARTITION_SIZE = 131,072`` tokens, and
+Pass structure, from the launcher: ``npar_loops <= 16`` runs the direct
+single-pass switch. Above that, ``num_passes = ceil(npar_loops / 8)``, each pass
+covering ``8 * WARP_SIZE * PARTITION_SIZE = 131,072`` tokens, and
 ``paged_attention_merge_reduce_kernel`` combines the passes with log-sum-exp.
-So ``npar_loops == 8`` is the single-pass control and everything above it
-exercises both the pass loop and the merge kernel.
+So the cases at 17 and beyond exercise both the pass loop and the merge kernel,
+while 9..16 stay on the direct path.
 """
 
 import pytest
@@ -37,6 +36,9 @@ from vllm.platforms import current_platform
 
 PARTITION_SIZE_ROCM = 256
 CDNA_WARP_SIZE = 64
+# Single-pass switch cases go to 16; above that the launcher splits into passes
+# of 8 npar_loops each.
+MAX_SINGLE_PASS_NPAR = 16
 NPAR_LOOPS_PER_PASS = 8
 
 NUM_HEADS = 8
@@ -51,9 +53,10 @@ REL_TOL = 2e-2
 
 # (seq_len, expected npar_loops, expected passes)
 LONG_CONTEXT_CASES = [
-    pytest.param(131_072, 8, 1, id="npar8-single-pass-control"),
-    pytest.param(139_264, 9, 2, id="npar9-first-multi-pass"),
-    pytest.param(266_240, 17, 3, id="npar17-past-old-ceiling"),
+    pytest.param(131_072, 8, 1, id="npar8-control"),
+    pytest.param(139_264, 9, 1, id="npar9-single-pass"),
+    pytest.param(262_144, 16, 1, id="npar16-last-single-pass"),
+    pytest.param(266_240, 17, 3, id="npar17-first-multi-pass"),
     pytest.param(524_288, 32, 4, id="npar32"),
     pytest.param(1_048_576, 64, 8, id="npar64-1M"),
     pytest.param(1_572_864, 96, 12, id="npar96-12-passes"),
@@ -66,7 +69,7 @@ def _npar_loops(seq_len: int) -> int:
 
 
 def _num_passes(npar_loops: int) -> int:
-    if npar_loops <= NPAR_LOOPS_PER_PASS:
+    if npar_loops <= MAX_SINGLE_PASS_NPAR:
         return 1
     return (npar_loops + NPAR_LOOPS_PER_PASS - 1) // NPAR_LOOPS_PER_PASS
 
