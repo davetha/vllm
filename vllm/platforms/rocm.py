@@ -365,6 +365,18 @@ def use_rocm_custom_paged_attention(
             (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
             and head_size in (64, 128, 192, 256)
+            # The free kernel returns incorrect results on gfx90a (CDNA2) for
+            # block_size > 64. Measured on MI210 against the reference: every
+            # free-kernel case with block_size in {128, 512, 1024, 2096}
+            # mismatches by order 1, while 16/32/64 agree at every head size
+            # this gate admits.
+            # This matters because hybrid models choose large blocks on their
+            # own -- attention is aligned to the mamba page size, giving 544
+            # for Qwen3-Next -- so without this they are silently admitted
+            # rather than routed to Triton as get_supported_kernel_block_sizes
+            # documents.
+            # Restricted to gfx90a: untested on gfx942/gfx950.
+            and (block_size <= 64 or not _ON_GFX90A)
             and (gqa_ratio >= 1 and gqa_ratio <= 16)
             and sinks is None
         )
@@ -381,7 +393,8 @@ def use_rocm_custom_paged_attention(
             and sinks is None
         )
     else:
-        # GFX11: only the template-specialized non-free kernel (head_size=128, block_size=16).
+        # GFX11: only the template-specialized non-free kernel
+        # (head_size=128, block_size=16).
         return (
             _ON_GFX1X
             and (sliding_window == 0 or sliding_window == (-1, -1))
