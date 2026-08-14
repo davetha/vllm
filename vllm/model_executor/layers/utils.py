@@ -257,6 +257,27 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     )
 
 
+def _dense_skinny_activation(x_view: torch.Tensor) -> torch.Tensor:
+    """Materialise `x_view` unless it is already an exactly-dense 2-D block.
+
+    `.contiguous()` is not sufficient here. PyTorch's contiguity test ignores
+    singleton dimensions, so a one-row strided slice reports is_contiguous() as
+    True while its stride(0) still exceeds its width. The skinny kernels read
+    stride(0) * rows elements linearly -- skinny_gemms.cu states that they "do
+    not take strides, and are unable to handle PyTorch tensors that return
+    is_contiguous() as False" -- so that gap is an out-of-bounds read. Being a
+    read it corrupts nothing, and it only faults when the over-read crosses an
+    unmapped page, which is why it presents as an allocator-layout-dependent
+    crash rather than a clear error.
+
+    The affected tensors are tiny (n <= 5 rows), so materialising costs a few KB
+    and keeps the fast kernel.
+    """
+    if x_view.stride() == (x_view.size(1), 1):
+        return x_view
+    return x_view.clone(memory_format=torch.contiguous_format)
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -304,7 +325,7 @@ def rocm_unquantized_gemm_impl(
     )
 
     if use_skinny_reduce_counting:
-        x_view = x.reshape(-1, x.size(-1)).contiguous()
+        x_view = _dense_skinny_activation(x.reshape(-1, x.size(-1)))
         return ops.wvSplitKrc(x_view, weight, cu_count, bias)
 
     # gfx1250's aiter gemm_a16w16 uses the gluon backend, which requires
@@ -328,8 +349,9 @@ def rocm_unquantized_gemm_impl(
 
     if use_skinny:
         # The skinny kernels assume contiguous K elements. A shape-preserving
-        # reshape can retain a transposed activation's non-contiguous strides.
-        x_view = x.reshape(-1, x.size(-1)).contiguous()
+        # reshape can retain a transposed activation's non-contiguous strides,
+        # and a singleton row hides them from is_contiguous() entirely.
+        x_view = _dense_skinny_activation(x.reshape(-1, x.size(-1)))
         if m > 8 and 0 < n <= 5:
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
