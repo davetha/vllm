@@ -202,3 +202,45 @@ def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
     x_view = wvsplitkrc_mock.call_args.args[0]
     assert x_view.is_contiguous()
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2])
+def test_rocm_unquantized_gemm_materialises_singleton_strided_activation(
+    monkeypatch, num_tokens
+):
+    """A row-slice of a wider tensor must be materialised before dispatch.
+
+    The rows are individually dense, but stride(0) is the PARENT width, so the
+    kernel's linear read of stride(0) * rows elements runs past the end of the
+    slice. With a single row PyTorch reports the tensor contiguous, because
+    singleton dimensions do not participate in its contiguity test -- which is
+    exactly why calling .contiguous() does not fix this case.
+    """
+    x = torch.randn(num_tokens, 256, dtype=torch.float16)[:, 128:]
+    assert x.stride() == (256, 1)
+    if num_tokens == 1:
+        # The trap: reports contiguous despite the oversized row stride.
+        assert x.is_contiguous()
+
+    weight = torch.randn(128, 128, dtype=torch.float16)
+
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
+    monkeypatch.setattr(utils, "num_compute_units", lambda: 120)
+
+    wvsplitk_mock = MagicMock(side_effect=lambda w, x_view, _, __: x_view @ w.t())
+    monkeypatch.setattr(utils.ops, "wvSplitK", wvsplitk_mock)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+    ref = torch.nn.functional.linear(x, weight, None)
+
+    wvsplitk_mock.assert_called_once()
+    dispatched = wvsplitk_mock.call_args.args[1]
+    assert dispatched.stride() == (128, 1), (
+        "activation reached the skinny kernel with an oversized row stride"
+    )
+    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
