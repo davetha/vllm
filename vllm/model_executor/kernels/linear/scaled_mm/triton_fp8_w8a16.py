@@ -57,6 +57,34 @@ tiebreaker either: v_mfma_f32_16x16x16bf16_1k measures 165.5 TFLOP/s against
 decode-cost question only.
 
 
+MEASUREMENT BASIS
+-----------------
+Every throughput figure in this file comes from the one table below, so that
+there is a single number per shape to keep current. It is quoted as fp8 weight
+bytes moved per second, at M=1, median of 30, on a card that is concurrently
+serving -- so treat small differences as noise.
+
+                       [N,K]-backed view    [K,N] contiguous copy
+    gate_up  34816x5120     611.7 GB/s            454.7 GB/s
+    down_proj 5120x17408    373.7 GB/s            224.2 GB/s
+    o_proj    4096x4096     169.1 GB/s            142.3 GB/s
+
+MEASURED AT the triton_fp8_w8a16_gemm wrapper: host wall clock with a
+torch.cuda.synchronize inside the timed region. That boundary includes the
+output allocation and the launch/sync cost of every call, so it is lower than
+the kernel alone and higher than what a layer actually sees. For gate_up at
+M=1 the same work measures roughly:
+
+    kernel only (profiler)        ~754 GB/s
+    this table (wrapper)           611.7 GB/s
+    through apply_weights          ~517 GB/s
+
+The kernel-only and apply_weights figures are from the separate profiling
+pass, not from this file's sweep; they are quoted here only to fix what the
+wrapper number does and does not contain. Compare like with like: a number
+taken at one boundary must not be set against a number taken at another.
+
+
 VARIANT 1 (DEFAULT): native fp8e4nv -> bf16 cast, bf16 dot
 ----------------------------------------------------------
 `b.to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)`. Triton lowers this on AMD
@@ -410,12 +438,12 @@ def triton_fp8_w8a16_gemm(
             # fewer workgroups than the card has CUs (104) -- and that argument
             # does not depend on what the decode costs.
             #
-            # Known soft spot for whoever retunes: at M=1 this ladder gets
-            # 612 GB/s on gate_up (34816x5120) and 374 on down_proj
-            # (5120x17408) but only 169 on o_proj (4096x4096). o_proj lands on
-            # the same 16x16x128 tile as down_proj with a quarter of down_proj's
-            # K, so it has the same 256-320 workgroups over far less work each
-            # and never amortises. That shape wants its own entry.
+            # Known soft spot for whoever retunes: o_proj is far behind the
+            # other two shapes in the MEASUREMENT BASIS table above. It lands
+            # on the same 16x16x128 tile as down_proj with a quarter of
+            # down_proj's K, so it has the same 256-320 workgroups over far
+            # less work each and never amortises. That shape wants its own
+            # entry.
             if M <= 8:
                 if N >= 16384:
                     BLOCK_M, BLOCK_N, BLOCK_K = 16, 32, 64
@@ -555,17 +583,13 @@ class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
         is BLOCK_K consecutive bytes (128 at the decode tile), which coalesces;
         calling .contiguous() would flip that to BLOCK_N consecutive bytes per
         row -- 16 at the same tile -- and would also double the layer's peak
-        memory during load. Both layouts were measured, median of 30, M=1, fp8
-        bytes moved per second:
+        memory during load. Both layouts were measured: see MEASUREMENT BASIS
+        in the module header, whose two columns are exactly this comparison.
 
-                                [N,K]-backed view    [K,N] contiguous copy
-            gate_up  34816x5120      611.7 GB/s             454.7 GB/s
-            down_proj 5120x17408     373.7 GB/s             224.2 GB/s
-            o_proj    4096x4096      169.1 GB/s             142.3 GB/s
-
-        The view wins everywhere, so the copy costs memory and time for
-        nothing. If a future tile ladder pushes BLOCK_N above BLOCK_K this
-        conclusion can invert -- re-measure before assuming it holds.
+        The view wins on every shape there, so the copy would cost memory and
+        time for nothing. That conclusion depends on BLOCK_K exceeding BLOCK_N,
+        which holds for every rung of the current ladder; if a future tile
+        table inverts that, re-measure before assuming this still holds.
         """
         w = layer.weight
 
