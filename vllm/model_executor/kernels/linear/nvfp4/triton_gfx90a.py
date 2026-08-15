@@ -1,0 +1,427 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Triton-based NVFP4 W4A16 (e2m1 weight, bf16/fp16 activation) GEMM for ROCm
+gfx90a.
+
+STATUS: ported from the standalone prototype/benchmark at
+`nvfp4_final.py` (session scratchpad, fp8-decode's #19 measurement:
+254-code-equivalent correctness pass on synthetic K=512,N=256 data, ~3.5
+decode ops/weight, beats an Emulation-style dequant+matmul baseline 2.26x
+wall-clock on gate_up-shaped data). NOT YET RUN on real GPU in this form --
+per team-lead's explicit boundary, the card is sequenced behind the FP8
+pipeline (e2e battery -> #17 benchmark -> fp8-impl's ladder measurements)
+and this kernel does not touch the GPU until cleared. Two things changed
+from the validated prototype that specifically need GPU re-verification
+before this ships (flagged inline at each site below):
+  1. Packing layout: the prototype's synthetic `make()` packs 8 e2m1 codes
+     per int32 (`codes[:, j::8] << (4*j)`). The REAL checkpoint (compressed
+     tensors' `weight_packed` / ModelOpt's `weight`) packs 2 codes per
+     UINT8 byte, low-nibble-first -- confirmed via `nvfp4.py`'s cross-check
+     against `torch.float4_e2m1fn_x2` in this same scratchpad, not assumed.
+     The unpack below is rewritten for byte-pair packing; the underlying
+     bit-shift E2M1 decode and subnormal-lift math are unchanged from the
+     validated prototype.
+  2. weight_global_scale: the prototype's synthetic harness only modeled
+     the per-16-group e4m3 scale, no global scalar (its test data had none).
+     Real NVFP4 checkpoints have both (base.py: "per-block weight scales
+     ... and scalar global scales"). Added here as a third, straightforward
+     fp32 multiply in the epilogue -- not present in the validated
+     prototype, needs its own correctness check once GPU access clears.
+
+Everything else (the E2M1 bit-trick decode, the subnormal-flush defense,
+the two-stage scale fold, the hoist/inner dual-kernel split) is ported
+as-measured from nvfp4_final.py, not re-derived.
+
+
+THE VALIDATED MATH (ported from nvfp4_final.py, credited there)
+-----------------------------------------------------------------
+e2m1 byte layout (OCP MX FP4, 1 sign + 2 exp[bias 1] + 1 mantissa, no
+inf/NaN): nibble n = [s e1 e0 m]. fp16 bits placing the exponent+mantissa
+field at fp16's own field positions: `((n & 7) << 9) | ((n & 8) << 12)`.
+Decoding that raw bit pattern as fp16 gives `true_e2m1_value * 2**-14`
+(fp16 bias 15 vs e2m1 bias 1, 2**(1-15) = 2**-14) -- and for e2m1's actual
+magnitudes (0.5..6) that raw decode lands in or near fp16's SUBNORMAL
+range (fp16 min normal 2**-14). gfx90a's v_mfma_f32_16x16x16f16 flushes
+subnormal MFMA *inputs* to zero (measured, see triton_fp8_w8a16.py's
+"SUBNORMAL FLUSH" section for the general finding on this card). The fix
+here is the same shape: multiply by 2**14 with a plain VALU op (which does
+NOT flush, only the MFMA path does) BEFORE the value ever reaches `tl.dot`.
+That multiply is not an extra scale -- it exactly cancels the -14 bias, so
+after it the value is the true e2m1 value, now safely inside fp16's normal
+range.
+
+The per-16-group scale byte is e4m3 (float8_e4m3fn), decoded via the
+identical bit-trick used in triton_fp8_w8a16.py's variant 2
+(`(byte<<7); +=(t&0x4000)`, bias -8 this time since e4m3's bias is 7 vs
+fp16's 15: 2**(7-15) = 2**-8), corrected by multiplying by 256.0. This is
+the "two-stage scale fold" team-lead referenced: weight-side fold (x2**14,
+inline in the K-loop, doubles as the subnormal-lift) and scale-side fold
+(x2**8, applied once per scale value), independent of each other.
+
+Two kernel variants, both correct, ported from nvfp4_final.py's
+`nvfp4_hoist` / `nvfp4_inner`, selected by BLOCK_K vs the group size (16):
+  - BLOCK_K <= 16 (one scale-group per K-tile): the per-group scale is
+    identical for the whole tile, so it hoists out of the K-loop into a
+    single per-(BLOCK_M,BLOCK_N) epilogue multiply -- O(BLOCK_M*BLOCK_N)
+    once instead of O(BLOCK_K*BLOCK_N) per K-tile. Same hoist idea as the
+    W4A16 int4 kernel's own scale hoist (2ec31f0ba6).
+  - BLOCK_K > 16 (multiple scale-groups per K-tile): scale changes within
+    the tile, so it can't be hoisted the same way -- applied per-element
+    to the decoded weight before the dot, with NSUB = BLOCK_K // 16
+    sub-groups broadcast across the tile.
+
+
+PACKING LAYOUT (real checkpoint, both compressed-tensors and ModelOpt)
+------------------------------------------------------------------------
+Weight arrives from the scheme as `(N, K // 2)` uint8, PACKED ALONG K
+(input_dim=1) -- i.e. each byte holds two CONSECUTIVE K-indices for the
+SAME output channel N, low nibble = lower K-index (confirmed against
+`torch.float4_e2m1fn_x2`'s own unpack convention in `nvfp4.py`, not
+assumed). This differs from the int4 W4A16 kernel, which packs along N
+(8 output channels per int32) -- NVFP4 packing needs no interleave-based
+unshuffle across N at all, only a lo/hi nibble split per byte, which is
+simpler than the int4 case.
+
+Neither CompressedTensorsW4A4Fp4 nor ModelOptNvFp4W4A16LinearMethod
+transposes the weight in process_weights_after_loading (checked both,
+neither calls `.t()`, unlike CompressedTensorsW8A16Fp8's FP8 scheme) --
+so this kernel's own process_weights_after_loading does it, the same
+`.t()`-and-leave-as-a-view choice triton_fp8_w8a16.py made for its weight
+(see _WEIGHT_LAYOUT there: the view wins over a forced-contiguous copy on
+every measured shape). Scale gets the same treatment for the same reason.
+"""
+
+from collections.abc import Sequence
+
+import torch
+
+from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
+
+from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
+
+GROUP_SIZE = 16
+
+
+@triton.jit
+def _nvfp4_w4a16_hoist(
+    a_ptr,  # [M, K]  bf16/fp16 activations
+    b_ptr,  # [K//2, N]  uint8, packed e2m1, 2 codes/byte along K (low nibble = lower K)
+    s_ptr,  # [K//16, N]  uint8, raw float8_e4m3fn bytes, per-16-group scale
+    global_scale,  # python float / 0-d tensor, fp32 -- weight_global_scale
+    c_ptr,  # [M, N]  bf16/fp16 output
+    M, N, K,
+    sam, sak, sbk, sbn, ssk, ssn, scm, scn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """BLOCK_K <= 16: exactly one scale-group per K-tile, scale hoisted to
+    the epilogue. Ported from nvfp4_final.py's `nvfp4_hoist`, packing
+    rewritten for byte-pair-along-K layout (see module header)."""
+    pid_m, pid_n = tl.program_id(0), tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    BLOCK_KP: tl.constexpr = BLOCK_K // 2  # packed-byte width of this K-tile
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for ks in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = ks * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        offs_kp = ks * BLOCK_KP + tl.arange(0, BLOCK_KP)
+        mask_kp = (ks * BLOCK_K + 2 * tl.arange(0, BLOCK_KP)) < K
+
+        a = tl.load(
+            a_ptr + offs_m[:, None] * sam + offs_k[None, :] * sak,
+            mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0,
+        )
+
+        # Load packed bytes as [BLOCK_N, BLOCK_KP] (N-rows, K-pair-cols) --
+        # orientation is a pointer-arithmetic choice only, not a physical
+        # layout requirement; see module header on why weight stays a
+        # `.t()` view rather than a forced-contiguous copy.
+        bp = tl.load(
+            b_ptr + offs_kp[None, :] * sbk + offs_n[:, None] * sbn,
+            mask=mask_kp[None, :] & mask_n[:, None], other=0,
+        )
+        lo = bp & 0xF
+        hi = (bp >> 4) & 0xF
+        # interleave along the last axis: lo[0],hi[0],lo[1],hi[1],... =
+        # increasing K order, matching the low-nibble-first convention.
+        codes = tl.interleave(lo, hi)  # [BLOCK_N, BLOCK_K]
+
+        # e2m1 -> fp16 raw bits, then lift by 2**14 (VALU multiply, does
+        # NOT flush subnormals -- see module header). This IS the bias
+        # correction, not an extra factor: after this vb holds the true
+        # e2m1 value, already normal-range-safe for the MFMA below.
+        vb = (((codes & 7) << 9) | ((codes & 8) << 12)).to(tl.int16).to(tl.float16, bitcast=True)
+        vb = vb * 16384.0
+        vb = tl.trans(vb)  # [BLOCK_K, BLOCK_N] for the dot
+
+        dot = tl.dot(a.to(tl.float16), vb, out_dtype=tl.float32)
+
+        # One scale-group covers this whole K-tile (BLOCK_K <= GROUP_SIZE).
+        g = (ks * BLOCK_K) // GROUP_SIZE
+        sb = tl.load(s_ptr + g * ssk + offs_n * ssn, mask=mask_n, other=0).to(tl.uint16)
+        t = sb << 7
+        t = t + (t & 0x4000)
+        s16 = t.to(tl.float16, bitcast=True)
+        # x256.0 undoes the e4m3->fp16 bias (see header); global_scale is
+        # the checkpoint's separate scalar NVFP4 global scale, fp32
+        # throughout per triton_fp8_w8a16.py's BF16 MULTIPLY LANDMINE
+        # (never do this multiply in bf16 -- truncates instead of RNE).
+        acc += dot * (s16.to(tl.float32) * 256.0 * global_scale)[None, :]
+
+    c = acc.to(c_ptr.type.element_ty)
+    c_ptrs = c_ptr + offs_m[:, None] * scm + offs_n[None, :] * scn
+    mask_c = (offs_m[:, None] < M) & mask_n[None, :]
+    tl.store(c_ptrs, c, mask=mask_c)
+
+
+@triton.jit
+def _nvfp4_w4a16_inner(
+    a_ptr, b_ptr, s_ptr, global_scale, c_ptr,
+    M, N, K,
+    sam, sak, sbk, sbn, ssk, ssn, scm, scn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    NSUB: tl.constexpr,
+):
+    """BLOCK_K > 16: multiple scale-groups per K-tile (NSUB = BLOCK_K //
+    16), scale applied per-element before the dot since it can't be
+    hoisted to a single epilogue multiply. Ported from nvfp4_final.py's
+    `nvfp4_inner`; packing rewritten for byte-pair-along-K (see header).
+
+    Here the weight-side x2**14 lift is folded into the SCALE instead of
+    applied to `vb` directly (matches the prototype's inner-variant
+    placement exactly) -- the product `vb * sf` still lands in the safe
+    range before `tl.dot` sees it, `vb` alone never does.
+    """
+    pid_m, pid_n = tl.program_id(0), tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    BLOCK_KP: tl.constexpr = BLOCK_K // 2
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for ks in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = ks * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        offs_kp = ks * BLOCK_KP + tl.arange(0, BLOCK_KP)
+        mask_kp = (ks * BLOCK_K + 2 * tl.arange(0, BLOCK_KP)) < K
+
+        a = tl.load(
+            a_ptr + offs_m[:, None] * sam + offs_k[None, :] * sak,
+            mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0,
+        )
+        bp = tl.load(
+            b_ptr + offs_kp[None, :] * sbk + offs_n[:, None] * sbn,
+            mask=mask_kp[None, :] & mask_n[:, None], other=0,
+        )
+        lo = bp & 0xF
+        hi = (bp >> 4) & 0xF
+        codes = tl.interleave(lo, hi)  # [BLOCK_N, BLOCK_K]
+        vb = (((codes & 7) << 9) | ((codes & 8) << 12)).to(tl.int16).to(tl.float16, bitcast=True)
+        vb = tl.trans(vb)  # [BLOCK_K, BLOCK_N], NOT yet lifted -- see docstring
+
+        g0 = (ks * BLOCK_K) // GROUP_SIZE
+        og = g0 + tl.arange(0, NSUB)
+        sb = tl.load(
+            s_ptr + og[:, None] * ssk + offs_n[None, :] * ssn,
+            mask=offs_n[None, :] < N, other=0,
+        ).to(tl.uint16)
+        t = sb << 7
+        t = t + (t & 0x4000)
+        # x16384.0 here carries BOTH the weight's own subnormal-lift AND
+        # its bias correction (see class docstring) -- vb alone stays
+        # small/subnormal-range until this product forms.
+        s16 = t.to(tl.float16, bitcast=True) * 16384.0
+        sf = tl.reshape(
+            tl.broadcast_to(s16[:, None, :], (NSUB, GROUP_SIZE, BLOCK_N)),
+            (BLOCK_K, BLOCK_N),
+        )
+        acc += tl.dot(a.to(tl.float16), vb * sf, out_dtype=tl.float32)
+
+    # e4m3->fp16 bias correction (x256.0) and the checkpoint's global
+    # scale, both fp32, applied once to the whole accumulator.
+    acc = acc * 256.0 * global_scale
+
+    c = acc.to(c_ptr.type.element_ty)
+    c_ptrs = c_ptr + offs_m[:, None] * scm + offs_n[None, :] * scn
+    mask_c = (offs_m[:, None] < M) & mask_n[None, :]
+    tl.store(c_ptrs, c, mask=mask_c)
+
+
+def triton_nvfp4_w4a16_gemm(
+    a: torch.Tensor,  # [M, K] bf16/fp16, contiguous
+    b_packed: torch.Tensor,  # [K//2, N] uint8, packed e2m1 (see module header)
+    scale_bytes: torch.Tensor,  # [K//16, N] uint8, raw e4m3 bytes
+    global_scale: float,  # checkpoint's scalar NVFP4 global scale
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    assert a.is_contiguous(), "Activation matrix must be contiguous"
+    M, K = a.shape
+    Kp, N = b_packed.shape
+    assert Kp * 2 == K, f"packed weight K//2={Kp} does not match activation K={K}"
+    assert scale_bytes.shape == (K // GROUP_SIZE, N), (
+        f"scale shape {tuple(scale_bytes.shape)} != ({K // GROUP_SIZE}, {N})"
+    )
+    if out_dtype is None:
+        out_dtype = a.dtype
+    c = torch.empty((M, N), dtype=out_dtype, device=a.device)
+
+    b_u8 = b_packed.view(torch.uint8) if b_packed.dtype != torch.uint8 else b_packed
+    s_u8 = scale_bytes.view(torch.uint8) if scale_bytes.dtype != torch.uint8 else scale_bytes
+
+    # Tile ladder: NOT independently retuned for NVFP4 -- inherited from
+    # the gfx90a int4 W4A16 ladder's shape (mixed_precision/triton_w4a16.py)
+    # as a starting point pending its own sweep, same as that kernel's own
+    # "Known soft spot for whoever retunes" note for shapes it didn't
+    # search either. BLOCK_K=16 defaults to the hoist variant since
+    # GROUP_SIZE=16 lets every tile hoist its scale; this is a principled
+    # default (one scale-group per tile, no per-element scale work) rather
+    # than a searched one.
+    num_warps = None
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx90a
+
+        if on_gfx90a():
+            if M <= 8:
+                BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 16
+            elif M <= 64:
+                BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
+            num_warps = 2
+        else:
+            BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 16
+    else:
+        BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 16
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    launch_opts = {} if num_warps is None else {"num_warps": num_warps}
+
+    common = dict(
+        M=M, N=N, K=K,
+        sam=a.stride(0), sak=a.stride(1),
+        sbk=b_u8.stride(0), sbn=b_u8.stride(1),
+        ssk=s_u8.stride(0), ssn=s_u8.stride(1),
+        scm=c.stride(0), scn=c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        **launch_opts,
+    )
+    if BLOCK_K <= GROUP_SIZE:
+        _nvfp4_w4a16_hoist[grid](a, b_u8, s_u8, global_scale, c, **common)
+    else:
+        _nvfp4_w4a16_inner[grid](a, b_u8, s_u8, global_scale, c, NSUB=BLOCK_K // GROUP_SIZE, **common)
+    return c
+
+
+class TritonNvFp4LinearKernel(NvFp4LinearKernel):
+    """Triton NVFP4 W4A16 GEMM for ROCm gfx90a (MI210).
+
+    Consumes bf16/fp16 activations directly (no activation quantization --
+    this is the weight-only path, `use_a16=True` at the scheme level) and
+    dequantizes packed e2m1 weights in the GEMM inner loop. See module
+    docstring for the full math and its GPU-untested status.
+    """
+
+    @classmethod
+    def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
+        # Gated on gfx90a specifically, same rationale as
+        # TritonW8A16Fp8LinearKernel: the subnormal-flush workaround and
+        # tile ladder are measured facts about this card, not proven
+        # elsewhere. Widen once someone measures gfx942/RDNA.
+        if not current_platform.is_rocm():
+            return False, "TritonNvFp4Linear requires ROCm"
+        from vllm.platforms.rocm import on_gfx90a
+
+        if not on_gfx90a():
+            return False, "TritonNvFp4Linear is only tuned/verified on gfx90a"
+        return True, None
+
+    @classmethod
+    def can_implement(cls, config: NvFp4LinearLayerConfig) -> tuple[bool, str | None]:
+        # NvFp4LinearLayerConfig carries no fields (see base.py) -- every
+        # NVFP4 layer shares the same packed-uint8 + per-16 e4m3 scale +
+        # scalar global-scale structure, so there is nothing here to
+        # reject on. Matches EmulationNvFp4LinearKernel's own
+        # unconditional True.
+        return True, None
+
+    def __init__(self, config: NvFp4LinearLayerConfig) -> None:
+        # Deliberately not calling a shared quant-activation base __init__
+        # -- there isn't one to skip here (NvFp4LinearKernel.__init__
+        # already only asserts can_implement/is_supported and stores
+        # config), unlike FP8ScaledMMLinearKernel's QuantFP8 construction.
+        # Kept as an explicit override anyway for symmetry with
+        # TritonW8A16Fp8LinearKernel / XPUW8A16FP8LinearKernel and in case
+        # a future NvFp4LinearKernel base grows one.
+        super().__init__(config)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Transpose packed weight and scale to K-major, leave as views.
+
+        Checkpoint layout (neither CompressedTensorsW4A4Fp4 nor
+        ModelOptNvFp4W4A16LinearMethod transposes before calling in --
+        confirmed by reading both, see module header):
+          weight:       [N, K//2]  uint8, e2m1 packed 2/byte along K
+          weight_scale: [N, K//16] float8_e4m3fn, per-group scale
+
+        Kernel wants (K-major, matching the activation's own K-contiguous
+        convention and triton_fp8_w8a16.py's precedent for this):
+          weight:       [K//2, N]  uint8   (`.t()` view)
+          weight_scale: [K//16, N] uint8   (`.t()` view, raw e4m3 bytes)
+
+        Left as `.t()` views rather than forced `.contiguous()` copies --
+        triton_fp8_w8a16.py measured the view winning on every shape it
+        tried for an analogous transpose; not independently re-measured
+        for NVFP4's different packing density, flagged for the GPU pass.
+        """
+        w = layer.weight
+        replace_parameter(layer, "weight", w.t())
+
+        s = layer.weight_scale
+        s_bytes = s.view(torch.uint8) if s.dtype != torch.uint8 else s
+        replace_parameter(layer, "weight_scale", s_bytes.t())
+
+        # weight_global_scale is already reduced to a single fp32 scalar
+        # by the calling scheme (CompressedTensorsW4A4Fp4 / ModelOpt both
+        # do `.max()` before this runs) -- consumed as-is, no transform.
+        if not hasattr(layer, "weight_global_scale"):
+            raise ValueError(
+                "TritonNvFp4Linear: layer has no weight_global_scale; both "
+                "the CompressedTensorsW4A4Fp4 and ModelOptNvFp4W4A16 schemes "
+                "populate this before calling the kernel, so its absence "
+                "means this layer was routed here incorrectly."
+            )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # x consumed directly, unquantized -- the W4A16 contract, same as
+        # TritonW8A16Fp8LinearKernel.apply_weights.
+        weight = layer.weight
+        weight_scale = layer.weight_scale
+        global_scale = float(layer.weight_global_scale)
+
+        x_2d = x.reshape(-1, x.shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+        out_shape = x.shape[:-1] + (weight.shape[1],)
+
+        output = triton_nvfp4_w4a16_gemm(
+            a=x_2d,
+            b_packed=weight,
+            scale_bytes=weight_scale,
+            global_scale=global_scale,
+            out_dtype=x.dtype,
+        )
+        if bias is not None:
+            output = output + bias
+        return output.reshape(out_shape)
