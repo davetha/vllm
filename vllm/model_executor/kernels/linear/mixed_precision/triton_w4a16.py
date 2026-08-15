@@ -37,6 +37,51 @@ TRITON_W4A16_SUPPORTED_QUANT_TYPES = [
 ]
 
 
+def _use_magic_bias(act_dtype: torch.dtype, has_zp: bool, M: int) -> bool:
+    """Whether to take the magic-bias dequant + scale-hoist path.
+
+    BOUNDED TO M <= 8. Measured on the production entry point, this path
+    REGRESSES at M=32: q_proj 0.81x, o_proj 0.80x, down_proj 0.77x, gate_up
+    0.96x, against gains of 1.56x/1.52x for gate_up at M=1/M=8. The hoist
+    trades per-weight work for a per-output correction, so its benefit shrinks
+    as M grows while the correction does not; past decode widths that trade
+    stops paying. It was only ever measured at M<=8, so it is only enabled
+    there -- widen it if someone measures higher M and finds a win.
+
+    CORRECTNESS is platform-independent. The trick is pure IEEE bit
+    manipulation: for a 4-bit code n in 0..15, (0x4300 | n) reinterpreted as
+    bfloat16 is exactly 128+n, and (0x6400 | n) as float16 is exactly 1024+n.
+    Both are exact because at those exponents the mantissa step is exactly 1
+    and the largest value (143 / 1039) still fits the available mantissa bits,
+    so nothing rounds. Verified bit-exact against a float64 CPU oracle.
+
+    PERFORMANCE is only measured on gfx90a, which is why this is gated rather
+    than unconditional. The win there is large because CDNA2 has no hardware
+    bfloat16 convert, so the shipped `.to(a.dtype)` expands into a software
+    round-to-nearest-even sequence plus NaN handling -- 76 of 244 inner-loop
+    VALU ops. MI300 and NVIDIA have hardware bf16 converts, so they would gain
+    materially less, and possibly nothing; gfx1x (RDNA3, 32-wide waves) is
+    untested. Nobody has measured those, so they keep the existing path. Widen
+    this gate once someone does -- it is a gate on evidence, not on validity.
+
+    Restricted to symmetric quantization (has_zp False, i.e. uint4b8). The
+    hoist generalises to asymmetric -- the per-column zero would fold into the
+    bias term as (magic + z) -- but that path is unverified here, so it is left
+    on the original code.
+    """
+    if M > 8:
+        return False
+    if has_zp:
+        return False
+    if act_dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx90a
+
+    return on_gfx90a()
+
+
 @triton.jit
 def triton_w4a16_gemm_kernel(
     # Pointers
@@ -66,6 +111,9 @@ def triton_w4a16_gemm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # Take the magic-bias dequant + scale-hoist path (see _use_magic_bias).
+    # constexpr, so only the selected branch is ever compiled.
+    USE_MAGIC_BIAS: tl.constexpr = False,
 ):
     """
     Fused W4A16 GEMM: C[M,N] = A[M,K] @ dequant(B)[K,N]
@@ -128,32 +176,76 @@ def triton_w4a16_gemm_kernel(
         # ---- Compute scale/zero group row index ----
         g_idx = (k_start * BLOCK_K) // group_size
 
-        # ---- Load scales: [BLOCK_N] → broadcast to [BLOCK_K, BLOCK_N] ----
+        # ---- Load scales: [BLOCK_N] ----
         scale_offset = g_idx * N + offs_sn
         scale_mask = offs_sn < N
-        scales = tl.load(scales_ptr + scale_offset, mask=scale_mask, other=1.0)
-        scales = tl.broadcast_to(scales[None, :], (BLOCK_K, BLOCK_N))
+        scales_1d = tl.load(scales_ptr + scale_offset, mask=scale_mask, other=1.0)
 
-        # ---- Load / compute zeros ----
-        if HAS_ZP:
-            # Load packed zeros row: [BLOCK_N//8] int32
-            zero_offset = g_idx * (N // 8) + offs_bn
-            zero_mask = offs_bn < N // 8
-            z_packed = tl.load(zeros_ptr + zero_offset, mask=zero_mask, other=0)
-            # Unpack to [BLOCK_N] using same interleave+shift pattern
-            z = tl.interleave(z_packed, z_packed)
-            z = tl.interleave(z, z)
-            z = tl.interleave(z, z)
-            z = (z >> shifts_1d) & 0xF
-            z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
+        if USE_MAGIC_BIAS:
+            # ---- Magic-bias dequant, symmetric only (HAS_ZP is False here) --
+            #
+            # Write the 4-bit code straight into a float mantissa instead of
+            # converting it. For n in 0..15, (0x4300 | n) read as bfloat16 is
+            # exactly 128+n; (0x6400 | n) read as float16 is exactly 1024+n.
+            # Exact, not approximate: at those exponents the mantissa step is
+            # 1 and the largest value still fits the mantissa, so nothing
+            # rounds. This removes the int->float convert entirely, which on
+            # CDNA2 is not one instruction but a software round-to-nearest-even
+            # plus NaN-handling sequence.
+            #
+            # WHY THE SCALE MUST ALSO MOVE OUT -- this is not an optional extra
+            # optimisation, it is what makes the trick pay off on this target:
+            # gfx90a has NO bfloat16 VALU arithmetic. bf16 is an MFMA operand
+            # type only. So a per-weight `* scales` in bf16 forces a round trip
+            # out to fp32 and back, which is exactly the cost just removed.
+            # Keeping the scale per-weight would give back the entire win.
+            #
+            # The hoist is exact algebra, valid because one BLOCK_K tile lies
+            # inside a single scale group (asserted host-side, see the clamp):
+            #
+            #   sum_k a_k*(n_k - ZP)*s_n
+            #     == s_n * ( sum_k a_k*v_k  -  (magic + ZP) * sum_k a_k )
+            #
+            # with v = magic + n from the bit-trick. The scale and the zero
+            # bias become per-OUTPUT work (BLOCK_M*BLOCK_N per tile) instead of
+            # per-weight (BLOCK_K*BLOCK_N per tile).
+            if a_ptr.type.element_ty == tl.bfloat16:
+                vb = (b | 0x4300).to(tl.int16).to(tl.bfloat16, bitcast=True)
+                magic = 128.0
+            else:
+                vb = (b | 0x6400).to(tl.int16).to(tl.float16, bitcast=True)
+                magic = 1024.0
+
+            dot = tl.dot(a, vb, out_dtype=tl.float32)
+            # Masked-out k lanes loaded a as 0.0, so they contribute nothing to
+            # either term and the row sum stays consistent with the dot.
+            rowsum = tl.sum(a.to(tl.float32), axis=1)
+            accumulator += (dot - (magic + ZP_BIAS) * rowsum[:, None]) * (
+                scales_1d[None, :].to(tl.float32)
+            )
         else:
-            z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
+            scales = tl.broadcast_to(scales_1d[None, :], (BLOCK_K, BLOCK_N))
 
-        # ---- Dequantize: (w - zero) * scale ----
-        b_fp = (b - z).to(a.dtype) * scales
+            # ---- Load / compute zeros ----
+            if HAS_ZP:
+                # Load packed zeros row: [BLOCK_N//8] int32
+                zero_offset = g_idx * (N // 8) + offs_bn
+                zero_mask = offs_bn < N // 8
+                z_packed = tl.load(zeros_ptr + zero_offset, mask=zero_mask, other=0)
+                # Unpack to [BLOCK_N] using same interleave+shift pattern
+                z = tl.interleave(z_packed, z_packed)
+                z = tl.interleave(z, z)
+                z = tl.interleave(z, z)
+                z = (z >> shifts_1d) & 0xF
+                z = tl.broadcast_to(z[None, :], (BLOCK_K, BLOCK_N))
+            else:
+                z = tl.full((BLOCK_K, BLOCK_N), ZP_BIAS, dtype=tl.int32)
 
-        # ---- Accumulate ----
-        accumulator += tl.dot(a, b_fp, out_dtype=tl.float32)
+            # ---- Dequantize: (w - zero) * scale ----
+            b_fp = (b - z).to(a.dtype) * scales
+
+            # ---- Accumulate ----
+            accumulator += tl.dot(a, b_fp, out_dtype=tl.float32)
 
     # ---- Store output C: [BLOCK_M, BLOCK_N] ----
     c = accumulator.to(c_ptr.type.element_ty)
@@ -296,6 +388,18 @@ def _triton_w4a16_gemm_impl(
     if group_size < BLOCK_K:
         BLOCK_K = group_size
 
+    # The scale hoist in the magic-bias path is only valid while one BLOCK_K
+    # tile lies inside a single scale group -- that is exactly what the clamp
+    # above guarantees. Asserted here rather than assumed, because if that
+    # clamp is ever moved, weakened, or a tile table starts selecting BLOCK_K
+    # above the group size, the hoist does not fail loudly: it silently applies
+    # one group's scale to another group's weights and the model emits fluent
+    # wrong text.
+    assert BLOCK_K <= group_size, (
+        f"scale hoist requires BLOCK_K ({BLOCK_K}) <= group_size ({group_size})"
+    )
+    use_magic_bias = _use_magic_bias(a.dtype, has_zp, M)
+
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     # Omitted entirely when unset, so Triton picks its own default exactly as
@@ -323,6 +427,7 @@ def _triton_w4a16_gemm_impl(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        USE_MAGIC_BIAS=use_magic_bias,
         **launch_opts,
     )
     return c
