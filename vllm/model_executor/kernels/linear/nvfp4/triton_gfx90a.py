@@ -8,12 +8,19 @@ STATUS: ported from the standalone prototype/benchmark at
 `nvfp4_final.py` (session scratchpad, fp8-decode's #19 measurement:
 254-code-equivalent correctness pass on synthetic K=512,N=256 data, ~3.5
 decode ops/weight, beats an Emulation-style dequant+matmul baseline 2.26x
-wall-clock on gate_up-shaped data). NOT YET RUN on real GPU in this form --
-per team-lead's explicit boundary, the card is sequenced behind the FP8
-pipeline (e2e battery -> #17 benchmark -> fp8-impl's ladder measurements)
-and this kernel does not touch the GPU until cleared. Two things changed
-from the validated prototype that specifically need GPU re-verification
-before this ships (flagged inline at each site below):
+wall-clock on gate_up-shaped data). Cleared for the GPU pass, which found
+this kernel had in fact NEVER COMPILED before that pass -- two fatal bugs
+in this file's byte-pair-along-K rewrite that a CPU-only oracle cannot see
+(it models the math, not Triton's own dtype semantics): a module-global
+`GROUP_SIZE` referenced inside @triton.jit bodies (NameError at trace
+time, fixed by an explicit `GS: tl.constexpr` kernel arg) and a uint8
+`codes` tensor shifted by 9/12 bits past its own width (Triton silently
+discards the high bits rather than promoting; fixed by widening to int32
+before shifting). Both are fixed in this version; see each kernel's own
+docstring for the full story and fp8-decode's re-verification for the
+result. Independent of the GPU-execution question, three things changed
+from the validated CPU-oracle-checked prototype and specifically needed
+GPU re-verification (flagged inline at each site below):
   1. Packing layout: the prototype's synthetic `make()` packs 8 e2m1 codes
      per int32 (`codes[:, j::8] << (4*j)`). The REAL checkpoint (compressed
      tensors' `weight_packed` / ModelOpt's `weight`) packs 2 codes per
@@ -140,10 +147,17 @@ def _nvfp4_w4a16_hoist(
     M, N, K,
     sam, sak, sbk, sbn, ssk, ssn, scm, scn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GS: tl.constexpr,
 ):
     """BLOCK_K <= 16: exactly one scale-group per K-tile, scale hoisted to
     the epilogue. Ported from nvfp4_final.py's `nvfp4_hoist`, packing
-    rewritten for byte-pair-along-K layout (see module header)."""
+    rewritten for byte-pair-along-K layout (see module header).
+
+    GS is GROUP_SIZE (module global, =16) passed explicitly as a
+    tl.constexpr kernel arg -- the module global itself can't be read from
+    inside a @triton.jit function body on this Triton version, it raises
+    NameError at trace time. See FATAL BUG A in this file's commit history
+    for the full story; this kernel never compiled before that fix."""
     pid_m, pid_n = tl.program_id(0), tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -175,20 +189,30 @@ def _nvfp4_w4a16_hoist(
         hi = (bp >> 4) & 0xF
         # interleave along the last axis: lo[0],hi[0],lo[1],hi[1],... =
         # increasing K order, matching the low-nibble-first convention.
-        codes = tl.interleave(lo, hi)  # [BLOCK_N, BLOCK_K]
+        codes = tl.interleave(lo, hi)  # [BLOCK_N, BLOCK_K], uint8
+
+        # FATAL BUG B, found on the GPU pass: codes is uint8 here, and the
+        # shifts below are by 9 and 12 bits -- both past uint8's own width,
+        # so Triton silently discards the high bits instead of promoting
+        # (it does warn; nobody was watching for it pre-GPU). Widen to
+        # int32 BEFORE shifting, mirroring the int4 W4A16 kernel's own
+        # proven pattern for exactly this hazard. Un-widened, this produced
+        # 380/478 zeros plus NaN on the remainder on real hardware -- not a
+        # subtle numerical drift, a silent bit-discard.
+        codes32 = codes.to(tl.int32)
 
         # e2m1 -> fp16 raw bits, then lift by 2**14 (VALU multiply, does
         # NOT flush subnormals -- see module header). This IS the bias
         # correction, not an extra factor: after this vb holds the true
         # e2m1 value, already normal-range-safe for the MFMA below.
-        vb = (((codes & 7) << 9) | ((codes & 8) << 12)).to(tl.int16).to(tl.float16, bitcast=True)
+        vb = (((codes32 & 7) << 9) | ((codes32 & 8) << 12)).to(tl.int16).to(tl.float16, bitcast=True)
         vb = vb * 16384.0
         vb = tl.trans(vb)  # [BLOCK_K, BLOCK_N] for the dot
 
         dot = tl.dot(a.to(tl.float16), vb, out_dtype=tl.float32)
 
-        # One scale-group covers this whole K-tile (BLOCK_K <= GROUP_SIZE).
-        g = (ks * BLOCK_K) // GROUP_SIZE
+        # One scale-group covers this whole K-tile (BLOCK_K <= GS).
+        g = (ks * BLOCK_K) // GS
         sb = tl.load(s_ptr + g * ssk + offs_n * ssn, mask=mask_n, other=0).to(tl.uint16)
         t = sb << 7
         t = t + (t & 0x4000)
@@ -211,7 +235,7 @@ def _nvfp4_w4a16_inner(
     M, N, K,
     sam, sak, sbk, sbn, ssk, ssn, scm, scn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    NSUB: tl.constexpr,
+    NSUB: tl.constexpr, GS: tl.constexpr,
 ):
     """BLOCK_K > 16: multiple scale-groups per K-tile (NSUB = BLOCK_K //
     16), scale applied per-element before the dot since it can't be
@@ -269,6 +293,25 @@ def _nvfp4_w4a16_inner(
     the inner path's different fold placement was never re-checked against
     the same failure mode until this pass -- verified now against 0/254
     codes on fp8-decode's oracle rather than assumed fixed by analogy.
+
+    TWO MORE FATAL BUGS FOUND ON THE ACTUAL GPU PASS (2026-08-15), both in
+    this file's byte-pair-along-K rewrite (the CPU oracle above models the
+    math, not Triton's own dtype semantics, so neither was visible to it --
+    this kernel had never actually compiled or executed before this fix):
+
+    (A) GROUP_SIZE (this module's plain-int global) was referenced directly
+    inside this @triton.jit body -- Triton raises NameError tracing it, so
+    the kernel never compiled. Fixed by adding `GS: tl.constexpr` as an
+    explicit kernel argument, passed from the launcher (`GROUP_SIZE` stays
+    a module global for the host-side uses in `triton_nvfp4_w4a16_gemm`).
+
+    (B) the byte-pair decode below shifts `codes` (uint8, from
+    `tl.interleave`) by 9 and 12 bits -- both past uint8's own width.
+    Triton silently discards the high bits rather than promoting the type;
+    unwidened, this produced 380/478 zeros plus NaN on the rest against
+    real hardware. Fixed by widening to int32 before shifting
+    (`codes32 = codes.to(tl.int32)`), mirroring the int4 W4A16 kernel's own
+    proven pattern for the identical hazard.
     """
     pid_m, pid_n = tl.program_id(0), tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -294,15 +337,19 @@ def _nvfp4_w4a16_inner(
         )
         lo = bp & 0xF
         hi = (bp >> 4) & 0xF
-        codes = tl.interleave(lo, hi)  # [BLOCK_N, BLOCK_K]
-        vb = (((codes & 7) << 9) | ((codes & 8) << 12)).to(tl.int16).to(tl.float16, bitcast=True)
+        codes = tl.interleave(lo, hi)  # [BLOCK_N, BLOCK_K], uint8
+        # Widen before shifting by 9/12 -- past uint8's own width, Triton
+        # silently discards the high bits otherwise (FATAL BUG B, see the
+        # docstring above).
+        codes32 = codes.to(tl.int32)
+        vb = (((codes32 & 7) << 9) | ((codes32 & 8) << 12)).to(tl.int16).to(tl.float16, bitcast=True)
         # x16384.0 HERE, on the weight, not on the scale (see the BUG FOUND
         # docstring above) -- vb is now the true e2m1 value, |v| in
         # [0.5, 6], always fp16-normal, same as the hoist kernel does.
         vb = vb * 16384.0
         vb = tl.trans(vb)  # [BLOCK_K, BLOCK_N]
 
-        g0 = (ks * BLOCK_K) // GROUP_SIZE
+        g0 = (ks * BLOCK_K) // GS
         og = g0 + tl.arange(0, NSUB)
         sb = tl.load(
             s_ptr + og[:, None] * ssk + offs_n[None, :] * ssn,
@@ -318,7 +365,7 @@ def _nvfp4_w4a16_inner(
         # the way the old combined-and-still-biased product could.
         s16 = t.to(tl.float16, bitcast=True) * 256.0
         sf = tl.reshape(
-            tl.broadcast_to(s16[:, None, :], (NSUB, GROUP_SIZE, BLOCK_N)),
+            tl.broadcast_to(s16[:, None, :], (NSUB, GS, BLOCK_N)),
             (BLOCK_K, BLOCK_N),
         )
         # vb * sf is now the TRUE dequantized weight -- no bias left to
@@ -394,9 +441,12 @@ def triton_nvfp4_w4a16_gemm(
         **launch_opts,
     )
     if BLOCK_K <= GROUP_SIZE:
-        _nvfp4_w4a16_hoist[grid](a, b_u8, s_u8, global_scale, c, **common)
+        _nvfp4_w4a16_hoist[grid](a, b_u8, s_u8, global_scale, c, GS=GROUP_SIZE, **common)
     else:
-        _nvfp4_w4a16_inner[grid](a, b_u8, s_u8, global_scale, c, NSUB=BLOCK_K // GROUP_SIZE, **common)
+        _nvfp4_w4a16_inner[grid](
+            a, b_u8, s_u8, global_scale, c,
+            NSUB=BLOCK_K // GROUP_SIZE, GS=GROUP_SIZE, **common,
+        )
     return c
 
 
