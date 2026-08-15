@@ -45,6 +45,24 @@ class TorchFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if compute_capability is not None and compute_capability < 89:
             return False, "requires compute capability 89 and above."
 
+        if current_platform.is_rocm():
+            # The compute-capability test above is a CUDA test, and ROCm
+            # reports gfx90a as (9, 0) -> 90, so it passes on hardware with no
+            # fp8 arithmetic at all. torch._scaled_mm then raises "only
+            # supported on ... ROCm MI300+" at the first forward pass.
+            #
+            # Sibling kernels in this file already gate on exactly this
+            # predicate (RowWiseTorchFP8ScaledMMLinearKernel); the per-tensor
+            # and per-channel variants inherit this method and did not, which
+            # is what let a gfx90a fp8 checkpoint select one and crash. Scheme
+            # routing is fixed separately in compressed_tensors.py -- this is
+            # the backstop for any other path that reaches these kernels, and
+            # it turns a runtime crash into a selection-time rejection.
+            from vllm.platforms.rocm import get_cdna_version, on_rdna4
+
+            if get_cdna_version() <= 2 and not on_rdna4():
+                return False, "requires CDNA3+ or RDNA4 on ROCm"
+
         return True, None
 
     def get_output_padding(self) -> int | None:
