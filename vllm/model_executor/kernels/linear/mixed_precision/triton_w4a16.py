@@ -37,16 +37,27 @@ TRITON_W4A16_SUPPORTED_QUANT_TYPES = [
 ]
 
 
-def _use_magic_bias(act_dtype: torch.dtype, has_zp: bool, M: int) -> bool:
+def _use_magic_bias(act_dtype: torch.dtype, has_zp: bool, block_m: int) -> bool:
     """Whether to take the magic-bias dequant + scale-hoist path.
 
-    BOUNDED TO M <= 8. Measured on the production entry point, this path
-    REGRESSES at M=32: q_proj 0.81x, o_proj 0.80x, down_proj 0.77x, gate_up
-    0.96x, against gains of 1.56x/1.52x for gate_up at M=1/M=8. The hoist
-    trades per-weight work for a per-output correction, so its benefit shrinks
-    as M grows while the correction does not; past decode widths that trade
-    stops paying. It was only ever measured at M<=8, so it is only enabled
-    there -- widen it if someone measures higher M and finds a win.
+    BOUNDED TO BLOCK_M <= 16, and the bound is structural rather than a
+    tuning artifact. The rank-1 correction costs O(BLOCK_M x BLOCK_N) per
+    K-tile -- the reduction over A plus the fused correction on the
+    accumulator -- while the decode work it removes is O(BLOCK_K x BLOCK_N)
+    and independent of BLOCK_M. The saving is therefore fixed per K-tile while
+    the correction's cost grows linearly with BLOCK_M, so the benefit/cost
+    ratio degrades monotonically and a crossover is guaranteed. It gets worse
+    at larger tiles, never better, and no future tile tuning recovers it.
+
+    Measured: gains of 1.56x/1.52x on gate_up at M=1/M=8 (BLOCK_M 16), against
+    regressions at M=32 (BLOCK_M 64) of q_proj 0.81x, o_proj 0.80x, down_proj
+    0.77x, gate_up 0.96x.
+
+    Gated on BLOCK_M, not M, deliberately. The two agree today only because of
+    how the tile ladder above happens to be written; they diverge as soon as M
+    is not padded 1:1 to the tile, and a change to that ladder would silently
+    break an M-keyed bound in one direction or the other. Prefill takes the
+    plain path for free under this rule, which is what we want.
 
     CORRECTNESS is platform-independent. The trick is pure IEEE bit
     manipulation: for a 4-bit code n in 0..15, (0x4300 | n) reinterpreted as
@@ -69,7 +80,7 @@ def _use_magic_bias(act_dtype: torch.dtype, has_zp: bool, M: int) -> bool:
     bias term as (magic + z) -- but that path is unverified here, so it is left
     on the original code.
     """
-    if M > 8:
+    if block_m > 16:
         return False
     if has_zp:
         return False
@@ -398,7 +409,7 @@ def _triton_w4a16_gemm_impl(
     assert BLOCK_K <= group_size, (
         f"scale hoist requires BLOCK_K ({BLOCK_K}) <= group_size ({group_size})"
     )
-    use_magic_bias = _use_magic_bias(a.dtype, has_zp, M)
+    use_magic_bias = _use_magic_bias(a.dtype, has_zp, BLOCK_M)
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
