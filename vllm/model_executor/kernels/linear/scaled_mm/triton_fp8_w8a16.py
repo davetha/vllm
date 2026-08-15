@@ -66,8 +66,15 @@ serving -- so treat small differences as noise.
 
                        [N,K]-backed view    [K,N] contiguous copy
     gate_up  34816x5120     611.7 GB/s            454.7 GB/s
-    down_proj 5120x17408    373.7 GB/s            224.2 GB/s
-    o_proj    4096x4096     169.1 GB/s            142.3 GB/s
+    down_proj 5120x17408    373.7 GB/s (stale)    224.2 GB/s (stale)
+    o_proj    4096x4096     169.1 GB/s (stale)    142.3 GB/s (stale)
+
+STALE ROWS: down_proj and o_proj have N < 16384, so at the time they were
+taken they ran (16, 16, 128). The ladder now gives every narrow-rung shape
+(16, 32, 64), which the tile sweep puts 7-9% ahead, so both rows understate
+the current kernel and need re-taking. gate_up was already on (16, 32, 64) at
+M=1 and is unaffected. Left in place rather than deleted because the
+view-vs-copy RATIO is what they are cited for, and both columns moved together.
 
 MEASURED AT the triton_fp8_w8a16_gemm wrapper: host wall clock with a
 torch.cuda.synchronize inside the timed region. That boundary includes the
@@ -83,6 +90,59 @@ The kernel-only and apply_weights figures are from the separate profiling
 pass, not from this file's sweep; they are quoted here only to fix what the
 wrapper number does and does not contain. Compare like with like: a number
 taken at one boundary must not be set against a number taken at another.
+
+
+TILE LADDER
+-----------
+Three tiles are in play, all float64-oracle-verified before being timed
+(4.5e-07 max rel err each, i.e. identical):
+
+    narrow  (16, 32, 64)  num_warps=2
+    bm32    (32, 32, 64)  num_warps=2
+    wide    (64, 64, 32)  default warps
+
+Fitted to a measured grid of 11 N-values x 10 M-values, and it reproduces the
+per-cell best tile on ALL 110 cells (0.00% mean loss, 0.00% worst). That is a
+fit to this grid, not a proof: the thresholds are shape boundaries, and the
+one at N=20000 is interpolated -- bm32 measured best at 16384 and wide at
+34816, with nothing measured between.
+
+HOW IT IS SAMPLED, which turned out to matter more than anything in the
+ladder. An earlier version of this grid rotated the three tiles call-to-call,
+to keep serving drift from favouring whichever arm ran first. That rotation
+silently handicapped the narrow tile by ~22%, because narrow at M>16 has
+grid_m=2 and re-reads its weights, so it depends on those weights still being
+in L2 -- and the wide tile's 64x64x32 access pattern evicts them between
+samples. bm32 (grid_m=1) does not care and was unaffected. Measured at
+N=5120, K=5120, M=24, median of 41:
+
+    configuration        narrow     bm32     wide
+    isolated (alone)      99.9us   109.8us  137.6us
+    narrow+bm32          101.5us   111.1us       -
+    narrow+wide          123.7us        -   137.9us
+    narrow+bm32+wide     123.6us   110.0us  138.5us
+
+Production runs one tile repeatedly for a given layer and never alternates, so
+the isolated column is the real one and the interleaved column is an artifact.
+Sampling now runs each arm in blocks long enough for cache state to be that
+arm's own, alternating blocks so drift still hits every arm, with 25 warmup
+iterations discarded per block (an isolated bm32 first-touch reads 151us before
+settling to 110us).
+
+Fixing that removed a phantom. The old grid showed the best tile oscillating
+with N -- bm32, bm32, narrow, narrow, ..., bm32, narrow, bm32 -- which looked
+like wave-quantisation ripple and was documented here as an argument that no
+threshold schedule could work. It was the sampling. The corrected surface is
+monotonic in both M and N, which is why the thresholds above fit it exactly.
+
+The M<=16 rung is unaffected by any of this and is where the money is: narrow
+beat wide at every N by 1.3-1.8x, and it won despite the handicap, so the true
+margin is if anything larger.
+
+Autotuning is still the better long-term answer than more thresholds, but for
+a different reason than previously recorded here: not because the surface is
+ragged (it is not), but because these boundaries are fitted to K=5120 and to
+one card, and K enters through how long each workgroup runs.
 
 
 VARIANT 1 (DEFAULT): native fp8e4nv -> bf16 cast, bf16 dot
@@ -438,21 +498,43 @@ def triton_fp8_w8a16_gemm(
             # fewer workgroups than the card has CUs (104) -- and that argument
             # does not depend on what the decode costs.
             #
-            # Known soft spot for whoever retunes: o_proj is far behind the
-            # other two shapes in the MEASUREMENT BASIS table above. It lands
-            # on the same 16x16x128 tile as down_proj with a quarter of
-            # down_proj's K, so it has the same 256-320 workgroups over far
-            # less work each and never amortises. That shape wants its own
-            # entry.
-            if M <= 8:
-                if N >= 16384:
-                    BLOCK_M, BLOCK_N, BLOCK_K = 16, 32, 64
-                else:
-                    BLOCK_M, BLOCK_N, BLOCK_K = 16, 16, 128
+            # (M, N)-keyed; see TILE LADDER in the module header for the
+            # measured grid this comes from and how it is sampled.
+            if M <= 16:
+                # narrow wins at every N measured, by 1.3-1.8x. Decode case.
+                BLOCK_M, BLOCK_N, BLOCK_K = 16, 32, 64
                 num_warps = 2
+            elif M <= 32:
+                if N < 14336:
+                    BLOCK_M, BLOCK_N, BLOCK_K = 16, 32, 64
+                    num_warps = 2
+                elif N < 20000:
+                    # Narrow band where BLOCK_M=32 wins: grid_m drops to 1 so
+                    # the weights are read once, and N is not yet wide enough
+                    # for the wide tile to take over. Upper bound is
+                    # INTERPOLATED -- measured bm32 at 16384 and wide at
+                    # 34816, nothing between.
+                    BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
+                    num_warps = 2
+                else:
+                    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            elif M <= 48:
+                if N < 12288:
+                    BLOCK_M, BLOCK_N, BLOCK_K = 16, 32, 64
+                    num_warps = 2
+                else:
+                    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
             elif M <= 64:
-                BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+                if N < 5120:
+                    BLOCK_M, BLOCK_N, BLOCK_K = 16, 32, 64
+                    num_warps = 2
+                else:
+                    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
             else:
+                # Inherited, and the only rung this grid does NOT cover: it
+                # was measured to M=64. (128, 128, 32) lost to (64, 64, 32) at
+                # every cell up to there, so this boundary is assumption, not
+                # measurement. Worth a sweep if prefill throughput matters.
                 BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
         else:
             if M <= 32:
@@ -587,9 +669,16 @@ class TritonW8A16Fp8LinearKernel(FP8ScaledMMLinearKernel):
         in the module header, whose two columns are exactly this comparison.
 
         The view wins on every shape there, so the copy would cost memory and
-        time for nothing. That conclusion depends on BLOCK_K exceeding BLOCK_N,
-        which holds for every rung of the current ladder; if a future tile
-        table inverts that, re-measure before assuming this still holds.
+        time for nothing.
+
+        SCOPE, stated precisely because the earlier wording overclaimed it:
+        that comparison was run at M=1, i.e. only on the narrow rung, where
+        BLOCK_K=64 exceeds BLOCK_N=32. BLOCK_K > BLOCK_N is the condition the
+        argument rests on, and it does NOT hold at the upper rungs -- (64, 64,
+        32) and (128, 128, 32) both have BLOCK_N >= BLOCK_K, which is exactly
+        the documented kill condition. So the layout choice is measured for
+        decode and UNMEASURED for prefill; M=32/64 is an open check, not a
+        settled result.
         """
         w = layer.weight
 
