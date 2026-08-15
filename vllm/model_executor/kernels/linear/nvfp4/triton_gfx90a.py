@@ -471,6 +471,19 @@ class TritonNvFp4LinearKernel(NvFp4LinearKernel):
         # weight_global_scale is already reduced to a single fp32 scalar
         # by the calling scheme (CompressedTensorsW4A4Fp4 / ModelOpt both
         # do `.max()` before this runs) -- consumed as-is, no transform.
+        #
+        # CONTRACT, stated explicitly after an adjudicated ambiguity
+        # (2026-08-15, fp8-decode's fixture testing + this kernel's own
+        # regression test below): this kernel receives a MULTIPLICATIVE
+        # global scale. CompressedTensorsW4A4Fp4.process_weights_after_loading
+        # has already inverted the on-disk divisor -- CT stores 1/scale on
+        # disk, see compressed_tensors_w4a4_nvfp4.py:110-114
+        # (`# Process weight global scale (CT stores as divisors, i.e.
+        # 1/scale)` / `1.0 / weight_global_scale`) -- so `apply_weights`
+        # below must MULTIPLY by this value, never divide. A harness that
+        # feeds raw on-disk bytes directly to this kernel, bypassing the
+        # scheme's own inversion, will get exactly backwards results; this
+        # was checked and ruled out for the shipped kernel, not assumed.
         if not hasattr(layer, "weight_global_scale"):
             raise ValueError(
                 "TritonNvFp4Linear: layer has no weight_global_scale; both "
