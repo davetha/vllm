@@ -159,6 +159,9 @@ from vllm.model_executor.kernels.linear.nvfp4.humming import (
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.nvfp4.triton_gfx90a import (
+    TritonNvFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -551,6 +554,9 @@ _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
         HummingNvFp4LinearKernel,
     ],
     PlatformEnum.ROCM: [
+        # gfx90a only; is_supported() rejects every other ROCm target, same
+        # pattern as TritonW8A16Fp8LinearKernel.
+        TritonNvFp4LinearKernel,
         EmulationNvFp4LinearKernel,
     ],
 }
@@ -1022,10 +1028,17 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
     """Select and instantiate the best NVFP4 linear kernel for the
     current platform."""
     config = NvFp4LinearLayerConfig()
+    # Not platform-filtered by construction -- FlashInfer/Marlin/Humming are
+    # CUDA-only (see their own is_supported()), TritonNvFp4LinearKernel is
+    # gfx90a-only. A kernel absent from this tuple is silently dropped by the
+    # `use_a16` filter below even if it's correctly registered in
+    # _POSSIBLE_NVFP4_KERNELS, so a new W4A16-capable kernel MUST be added
+    # here too, not just to the platform registry.
     a16_kernels = (
         FlashInferCuteDslNvFp4W4A16LinearKernel,
         MarlinNvFp4LinearKernel,
         HummingNvFp4LinearKernel,
+        TritonNvFp4LinearKernel,
     )
 
     # VLLM_BATCH_INVARIANT forces deterministic execution. Prefer the
@@ -1062,7 +1075,13 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
                 reason,
             )
             force_kernel = EmulationNvFp4LinearKernel
-    elif linear_backend == "auto" and use_a16:
+    elif linear_backend == "auto" and use_a16 and current_platform.is_cuda():
+        # Platform-gated deliberately (gfx90a patch stack): unguarded, this
+        # fired on every platform (ROCm included) and raised before ever
+        # reaching the registry search below, since the CUDA kernels'
+        # is_supported() are CUDA-only. On other platforms this now falls
+        # through to the registry search, which is where a platform's own
+        # W4A16 kernel (e.g. TritonNvFp4LinearKernel on gfx90a) gets picked.
         _cc = current_platform.get_device_capability()
         compute_capability = _cc.to_int() if _cc is not None else None
         # Weight-only: prefer FlashInfer CuTe-DSL W4A16 on SM100/103,
@@ -1260,6 +1279,7 @@ __all__ = [
     "FlashInferTrtllmNvFp4LinearKernel",
     "FlashInferCudnnNvFp4LinearKernel",
     "MarlinNvFp4LinearKernel",
+    "TritonNvFp4LinearKernel",
     "_KernelT",
     "DeepGemmFp8BlockScaledMMKernel",
     "FlashInferFp8DeepGEMMDynamicBlockScaledKernel",
