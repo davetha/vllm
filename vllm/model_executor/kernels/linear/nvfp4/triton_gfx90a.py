@@ -17,8 +17,17 @@ before this ships (flagged inline at each site below):
   1. Packing layout: the prototype's synthetic `make()` packs 8 e2m1 codes
      per int32 (`codes[:, j::8] << (4*j)`). The REAL checkpoint (compressed
      tensors' `weight_packed` / ModelOpt's `weight`) packs 2 codes per
-     UINT8 byte, low-nibble-first -- confirmed via `nvfp4.py`'s cross-check
-     against `torch.float4_e2m1fn_x2` in this same scratchpad, not assumed.
+     UINT8 byte, low-nibble-first. CORRECTION: `nvfp4.py`'s attempted
+     cross-check against `torch.float4_e2m1fn_x2` never actually ran --
+     `.to(torch.float32)` raises `NotImplementedError` on this build, so
+     that script fell through to its OCP-spec-table path instead (it has a
+     try/except around exactly this, and would have said so had anyone
+     checked its output rather than assumed the cross-check passed). The
+     nibble convention here rests on the OCP MX FP4 spec plus a
+     self-consistent round-trip through the spec's own table, NOT on a
+     torch built-in cross-check as previously (wrongly) claimed. The GPU
+     pass, once cleared, validates this against a real checkpoint tensor
+     directly, which settles it properly.
      The unpack below is rewritten for byte-pair packing; the underlying
      bit-shift E2M1 decode and subnormal-lift math are unchanged from the
      validated prototype.
@@ -28,6 +37,18 @@ before this ships (flagged inline at each site below):
      ... and scalar global scales"). Added here as a third, straightforward
      fp32 multiply in the epilogue -- not present in the validated
      prototype, needs its own correctness check once GPU access clears.
+  3. FIXED, pre-GPU, during verification prep: the inner kernel (BLOCK_K >
+     16, i.e. M>=9 serving) inherited a real bug from the prototype's own
+     scale-fold placement -- it fed the MFMA `true_e2m1 * true_scale *
+     2**-8`, which underflows fp16's normal floor for 30 of 254 e4m3 scale
+     codes and silently zeroed weights (whole blocks, for the smallest
+     scale codes) via the same subnormal-input MFMA flush documented below.
+     The hoist kernel (BLOCK_K <= 16) was never affected -- its scale
+     correction happens in fp32 on the accumulator, post-dot, not in fp16
+     pre-dot. Full derivation and the fix in `_nvfp4_w4a16_inner`'s own
+     docstring. Verified 0/254 codes against fp8-decode's float64 oracle,
+     op-count neutral (the moved multiply lands on the scale, 1/16th the
+     elements of the weight tile).
 
 Everything else (the E2M1 bit-trick decode, the subnormal-flush defense,
 the two-stage scale fold, the hoist/inner dual-kernel split) is ported
@@ -76,9 +97,13 @@ PACKING LAYOUT (real checkpoint, both compressed-tensors and ModelOpt)
 ------------------------------------------------------------------------
 Weight arrives from the scheme as `(N, K // 2)` uint8, PACKED ALONG K
 (input_dim=1) -- i.e. each byte holds two CONSECUTIVE K-indices for the
-SAME output channel N, low nibble = lower K-index (confirmed against
-`torch.float4_e2m1fn_x2`'s own unpack convention in `nvfp4.py`, not
-assumed). This differs from the int4 W4A16 kernel, which packs along N
+SAME output channel N, low nibble = lower K-index. This rests on the OCP
+MX FP4 spec's own nibble ordering, not a runtime cross-check against
+`torch.float4_e2m1fn_x2` -- that path in `nvfp4.py` never actually ran on
+this build (`.to(torch.float32)` raises `NotImplementedError`), see the
+correction at the top of this file. The GPU pass validates this directly
+against a real checkpoint tensor, which is the check that actually settles
+it. This differs from the int4 W4A16 kernel, which packs along N
 (8 output channels per int32) -- NVFP4 packing needs no interleave-based
 unshuffle across N at all, only a lo/hi nibble split per byte, which is
 simpler than the int4 case.
@@ -193,10 +218,57 @@ def _nvfp4_w4a16_inner(
     hoisted to a single epilogue multiply. Ported from nvfp4_final.py's
     `nvfp4_inner`; packing rewritten for byte-pair-along-K (see header).
 
-    Here the weight-side x2**14 lift is folded into the SCALE instead of
-    applied to `vb` directly (matches the prototype's inner-variant
-    placement exactly) -- the product `vb * sf` still lands in the safe
-    range before `tl.dot` sees it, `vb` alone never does.
+    BUG FOUND DURING VERIFICATION PREP (2026-08-15, fp8-decode's CPU oracle
+    + measured cliff, both cited in the fix commit) -- inherited from the
+    prototype, not introduced here, and NOT caught by the earlier debug
+    probes because those used |scale| ~ 1e-3..1, above the failure floor.
+
+    The prototype's placement folded the weight's own x2**14 lift onto the
+    SCALE instead of onto `vb` (comment used to say "the product `vb * sf`
+    still lands in the safe range before `tl.dot` sees it" -- that claim
+    was wrong, not just imprecise). With that placement, `sf` = true_scale
+    * 2**6 (true_scale * 2**-8, e4m3's own bias, times the borrowed 2**14),
+    and `vb` alone = true_e2m1 * 2**-14 (never lifted). The PRODUCT fed to
+    `tl.dot` was therefore `vb * sf` = true_e2m1 * true_scale * 2**-8 --
+    still biased by 2**-8, not the true weight -- and for any |true_scale|
+    < 2**-5, that product falls below fp16's normal floor (2**-14) even at
+    e2m1's largest magnitude (6.0): 6.0 * 2**-5 * 2**-8 = 2**-9.4, already
+    subnormal; smaller e2m1 codes or smaller scales push further under.
+    30 of 254 e4m3 scale codes have |value| < 2**-5; scale code 0x01 is far
+    enough under the floor that it zeroed entire 16-element blocks outright
+    via the same v_mfma_f32_16x16x16f16 subnormal-input flush documented in
+    the class docstring and in triton_fp8_w8a16.py -- not a new hardware
+    fact, a new way to accidentally feed it a subnormal operand.
+
+    FIX: give the whole 2**14 to `vb` (matching the hoist kernel exactly --
+    `vb` becomes the true e2m1 value, |v| in [0.5, 6], always fp16-normal)
+    and only 2**8 to the scale (`s16` becomes the true scale value, |s| in
+    [2**-9, 448] for e4m3's actual dynamic range, also always fp16-normal
+    on its own). `vb * s16` is then already the TRUE dequantized weight --
+    both factors individually normal-range BEFORE the multiply, computed by
+    the VALU (which does not flush), so the product can't reintroduce a
+    subnormal operand the way the old single combined-and-still-biased
+    product could. The epilogue's separate `* 256.0` is deleted -- there is
+    no scale bias left to correct, only the checkpoint's own global_scale.
+    Op-count neutral: the moved multiply now lands on the scale, which has
+    1/16th the elements of the weight tile.
+
+    WHY THE HOIST KERNEL (BLOCK_K <= 16) WAS IMMUNE: its scale-side x256.0
+    correction happens in fp32, on the fp32 accumulator, AFTER `tl.dot` --
+    not in fp16, not before an MFMA. fp32's subnormal floor (~2**-126) is
+    unreachable by any real e4m3 scale magnitude, so there was never a
+    subnormal fp16 operand for that path to feed the MFMA in the first
+    place. `vb` there was already lifted by 2**14 pre-dot, same as this
+    fix now does here.
+
+    LESSON: a late-discovered hardware fact (the MFMA subnormal-input
+    flush) has to be re-verified against EVERY code path it could touch,
+    not just the one that surfaced it. It was first found and fixed in the
+    FP8 kernel's variant 2, ported correctly to this kernel's hoist path
+    (which mirrors variant 2's own hoisted-scale-in-fp32 structure), but
+    the inner path's different fold placement was never re-checked against
+    the same failure mode until this pass -- verified now against 0/254
+    codes on fp8-decode's oracle rather than assumed fixed by analogy.
     """
     pid_m, pid_n = tl.program_id(0), tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -224,7 +296,11 @@ def _nvfp4_w4a16_inner(
         hi = (bp >> 4) & 0xF
         codes = tl.interleave(lo, hi)  # [BLOCK_N, BLOCK_K]
         vb = (((codes & 7) << 9) | ((codes & 8) << 12)).to(tl.int16).to(tl.float16, bitcast=True)
-        vb = tl.trans(vb)  # [BLOCK_K, BLOCK_N], NOT yet lifted -- see docstring
+        # x16384.0 HERE, on the weight, not on the scale (see the BUG FOUND
+        # docstring above) -- vb is now the true e2m1 value, |v| in
+        # [0.5, 6], always fp16-normal, same as the hoist kernel does.
+        vb = vb * 16384.0
+        vb = tl.trans(vb)  # [BLOCK_K, BLOCK_N]
 
         g0 = (ks * BLOCK_K) // GROUP_SIZE
         og = g0 + tl.arange(0, NSUB)
@@ -234,19 +310,24 @@ def _nvfp4_w4a16_inner(
         ).to(tl.uint16)
         t = sb << 7
         t = t + (t & 0x4000)
-        # x16384.0 here carries BOTH the weight's own subnormal-lift AND
-        # its bias correction (see class docstring) -- vb alone stays
-        # small/subnormal-range until this product forms.
-        s16 = t.to(tl.float16, bitcast=True) * 16384.0
+        # x256.0, not x16384.0 -- undoes ONLY the e4m3->fp16 bias, giving
+        # the true scale value, |s| in [2**-9, 448] for e4m3's actual
+        # dynamic range, always fp16-normal on its own. vb and s16 are each
+        # individually safe BEFORE this multiply, so their product (formed
+        # by the VALU, not the MFMA) can't reintroduce a subnormal operand
+        # the way the old combined-and-still-biased product could.
+        s16 = t.to(tl.float16, bitcast=True) * 256.0
         sf = tl.reshape(
             tl.broadcast_to(s16[:, None, :], (NSUB, GROUP_SIZE, BLOCK_N)),
             (BLOCK_K, BLOCK_N),
         )
+        # vb * sf is now the TRUE dequantized weight -- no bias left to
+        # correct in the epilogue, only the checkpoint's own global scale.
         acc += tl.dot(a.to(tl.float16), vb * sf, out_dtype=tl.float32)
 
-    # e4m3->fp16 bias correction (x256.0) and the checkpoint's global
-    # scale, both fp32, applied once to the whole accumulator.
-    acc = acc * 256.0 * global_scale
+    # No e4m3->fp16 bias correction here anymore -- it was already applied
+    # per-element above. Only the checkpoint's own fp32 global scale.
+    acc = acc * global_scale
 
     c = acc.to(c_ptr.type.element_ty)
     c_ptrs = c_ptr + offs_m[:, None] * scm + offs_n[None, :] * scn
