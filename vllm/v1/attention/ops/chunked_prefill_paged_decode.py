@@ -307,7 +307,9 @@ def kernel_paged_attention_2d(
 # ---------------------------------------------------------------------------
 
 _PA_PARTITION_MIN = 512
-_PA_MAX_PARTITIONS = 512
+_PA_MAX_PARTITIONS = 1024
+_PA_SCRATCH_BUDGET = int(
+    os.environ.get("VLLM_TRITON_PA_SCRATCH_BUDGET_MB", "128")) * 1024 * 1024
 
 
 @functools.lru_cache(maxsize=1)
@@ -328,7 +330,8 @@ def _seq_partition_target_programs() -> int:
 
 
 def _choose_partition_size(
-    num_seqs: int, num_kv_heads: int, seq_len_bound: int, block_size: int
+    num_seqs: int, num_kv_heads: int, seq_len_bound: int, block_size: int,
+    num_query_heads: int = 32, head_size_padded: int = 256,
 ) -> int:
     """Partition size in tokens, or 0 to keep the single-program-per-seq path.
 
@@ -358,10 +361,16 @@ def _choose_partition_size(
     if seq_len_bound < 2 * _PA_PARTITION_MIN:
         return 0
     base = max(1, num_seqs * num_kv_heads)
-    want = max(1, -(-_seq_partition_target_programs() // base))
-    if want <= 1:
-        return 0
-    part_size = max(_PA_PARTITION_MIN, -(-seq_len_bound // want))
+    if base >= _seq_partition_target_programs():
+        return 0  # the (seq, kv_head) grid already saturates the device
+    # Take the finest partition the scratch budget affords rather than sizing
+    # for occupancy AT THE BOUND: the bound is max_model_len, so occupancy
+    # sizing leaves most partitions empty at realistic context lengths. Surplus
+    # partitions cost one early-exiting program each.
+    bytes_per_part = max(1, num_seqs * num_query_heads * head_size_padded * 4)
+    max_parts = max(1, _PA_SCRATCH_BUDGET // bytes_per_part)
+    max_parts = min(max_parts, _PA_MAX_PARTITIONS)
+    part_size = max(_PA_PARTITION_MIN, -(-seq_len_bound // max_parts))
     # Quantise to a power of two: PARTITION_SIZE is a constexpr, so an
     # unquantised value would trigger a fresh Triton compile per batch shape.
     part_size = triton.next_power_of_2(part_size)
@@ -835,7 +844,9 @@ def chunked_prefill_paged_decode(
             max_seq_len, processed_block_table.shape[1] * real_block_size
         )
         part_size = _choose_partition_size(
-            num_seqs, num_kv_heads, seq_len_bound, TRITON_BLOCK_SIZE
+            num_seqs, num_kv_heads, seq_len_bound, TRITON_BLOCK_SIZE,
+            num_query_heads=num_query_heads,
+            head_size_padded=triton.next_power_of_2(head_size),
         )
         if part_size:
             max_parts = (seq_len_bound + part_size - 1) // part_size
@@ -851,8 +862,8 @@ def chunked_prefill_paged_decode(
                 device=query.device,
             )
             tmp_l = torch.empty_like(tmp_m)
-            logger.debug_once(
-                "Triton paged decode: sequence partitioning on "
+            logger.warning_once(
+                "Triton paged decode: sequence partitioning ON "
                 "(%d seqs x %d kv heads x %d partitions of %d tokens).",
                 num_seqs,
                 num_kv_heads,
