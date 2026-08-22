@@ -418,6 +418,25 @@ def _rocm_free_paged_attention_ok(head_size: int, block_size: int) -> bool:
 
 
 @cache
+@cache
+def _free_pa_large_block_ok() -> bool:
+    """Opt-in escape from the gfx90a block_size <= 64 restriction above.
+
+    That restriction exists because the free paged-attention kernel addressed
+    KV slots from the PARTITION-LOCAL token index rather than the global one,
+    in two places (the K slot offset, and a V base pointer hoisted out of the
+    vtoken_depth loop). Both are only congruent to the correct value when
+    block_size divides the partition size, which is why 16/32/64 agreed with
+    the reference and 128/512/1024/2096 mismatched by order 1.
+
+    csrc/rocm/attention.cu now derives both offsets from the global token
+    index. Set VLLM_ROCM_FREE_PA_LARGE_BLOCK=1 to admit block_size > 64 on
+    gfx90a and use the custom kernel; leave it unset to keep the conservative
+    behaviour and stay on the Triton fallback.
+    """
+    return os.environ.get("VLLM_ROCM_FREE_PA_LARGE_BLOCK", "0") == "1"
+
+
 def use_rocm_custom_paged_attention(
     qtype: torch.dtype,
     head_size: int,
@@ -462,7 +481,7 @@ def use_rocm_custom_paged_attention(
             # rather than routed to Triton as get_supported_kernel_block_sizes
             # documents.
             # Restricted to gfx90a: untested on gfx942/gfx950.
-            and (block_size <= 64 or not _ON_GFX90A)
+            and (block_size <= 64 or not _ON_GFX90A or _free_pa_large_block_ok())
             and (gqa_ratio >= 1 and gqa_ratio <= 16)
             and sinks is None
         )
