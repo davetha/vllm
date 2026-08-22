@@ -3882,7 +3882,25 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_free_kernel
     const int64_t kblock_number = static_cast<int64_t>(kphysical_block_number[token_depth]);
     const cache_t* k_ptr2 = k_ptr + kblock_number * kv_block_stride;
     const int klocal_token_idx = TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
-    const int kphysical_block_offset = klocal_token_idx % block_size;
+    // Same bug, same fix as the GFX9 free kernel above: the slot within the
+    // physical block must come from the GLOBAL token index, because
+    // partition_start_token_idx is a multiple of T_PAR_SIZE (256) and is
+    // congruent to 0 mod block_size only when block_size divides 256.
+    //
+    // NOT TESTED ON RDNA4 -- this repo owns no such card. It is applied anyway
+    // because it is a provable no-op wherever the current code is already
+    // correct: when block_size divides 256, partition_start_token_idx % block_size
+    // is 0 and the global and partition-local indices are congruent, so the
+    // computed offset is identical. It can only change behaviour for block_size
+    // values that do NOT divide 256 -- which is exactly where the current code
+    // is wrong. So it cannot regress any block size RDNA4 handles correctly
+    // today. The V path here already derives its offset per vtoken_depth.
+    //
+    // This matters more on GFX12 than on GFX9: use_rocm_custom_paged_attention's
+    // _ON_GFX12X branch carries NO block_size restriction, so large block sizes
+    // are admitted there rather than being routed to Triton.
+    const int kglobal_slot_token_idx = partition_start_token_idx + klocal_token_idx;
+    const int kphysical_block_offset = kglobal_slot_token_idx % block_size;
     const cache_t* k_ptr3 = k_ptr2 + kphysical_block_offset * KX;
     for (int qkhe_depth = 0; qkhe_depth < qkheloop; qkhe_depth++) {
       const int head_elem = row_head_elem + qkhe_depth * QKHE_PER_FETCH;
