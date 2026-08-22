@@ -2231,7 +2231,14 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_free_kernel
     const cache_t* k_ptr2 = k_ptr + kblock_number * kv_block_stride;
     const int klocal_token_idx =
         TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
-    const int kphysical_block_offset = klocal_token_idx % block_size;
+    // The slot within the physical block must be derived from the GLOBAL
+    // token index. partition_start_token_idx is a multiple of T_PAR_SIZE
+    // (256), which is congruent to 0 mod block_size only when block_size
+    // divides 256. For 512 / 784 / 1024 it is not, so the partition-local
+    // index silently addresses the wrong slot of the right block.
+    const int kglobal_slot_token_idx =
+        partition_start_token_idx + klocal_token_idx;
+    const int kphysical_block_offset = kglobal_slot_token_idx % block_size;
     const cache_t* k_ptr3 = k_ptr2 + kphysical_block_offset * KX;
 
     for (int qkhe_depth = 0; qkhe_depth < qkheloop; qkhe_depth++) {
@@ -2272,8 +2279,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_free_kernel
   }
 
 
-  const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride +
-                         ((rowid * VTOKENS_PER_LANE) % block_size);
+  // NOTE: the per-token slot offset is NOT hoisted here. It depends on
+  // vtoken_depth and on the partition base, so it is computed inside the
+  // fetch loop below.
+  const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride;
 
   auto fetchV = [&]() {
     // fetch V values (runtime head_size for vheloop, runtime block_size for addressing)
@@ -2282,11 +2291,26 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_free_kernel
       const cache_t* v_ptr2 = v_ptr + vhead_elem * block_size;
 
       for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
+        // Slot within the physical block, from the GLOBAL token index. The
+        // previous code folded (rowid * VTOKENS_PER_LANE) % block_size into
+        // v_ptr, dropping BOTH the partition base and the
+        // vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP (= 64) term. That is
+        // correct only when block_size divides both 64 and 256, i.e. for
+        // block_size in {16, 32, 64} -- which is exactly the set the gfx90a
+        // gate in vllm/platforms/rocm.py had to restrict itself to.
+        // block_size is a multiple of 16 and VTOKENS_PER_LANE is 16, so a
+        // lane's 16 consecutive tokens never straddle a block boundary.
+        const int vlocal_token_idx =
+            vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
+            rowid * VTOKENS_PER_LANE;
+        const int vphysical_block_offset =
+            (partition_start_token_idx + vlocal_token_idx) % block_size;
         for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++) {
           const int vblock_depth = 0;
           const int64_t vblock_number = static_cast<int64_t>(
               vphysical_block_number[vtoken_depth][vblock_depth]);
-          const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride);
+          const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride) +
+                                  vphysical_block_offset;
           const cache_t* v_fetch_ptr =
               v_ptr3 + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
           const _B16x8* v_fetch_ptr_16B =
