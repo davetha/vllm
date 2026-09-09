@@ -5,15 +5,50 @@
 
 #include <cstdint>
 #include <string>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#ifdef USE_ROCM
+  #include <hip/hip_bf16.h>
+  #include <hip/hip_fp16.h>
+  #include <hip/hip_runtime.h>
+// CDNA/RDNA spell the 16-bit float types differently; the kernel body below is
+// written against the CUDA names.
+using __nv_bfloat16 = __hip_bfloat16;
+using __nv_bfloat162 = __hip_bfloat162;
+// ROCm ships no __floats2bfloat162_rn; __float2bfloat16 is already round-to-nearest-even.
+__device__ __host__ __forceinline__ __nv_bfloat162 __floats2bfloat162_rn(float x,
+                                                                         float y) {
+  __nv_bfloat162 result;
+  result.x = __float2bfloat16(x);
+  result.y = __float2bfloat16(y);
+  return result;
+}
+#else
+  #include <cuda_bf16.h>
+  #include <cuda_fp16.h>
+  #include <cuda_runtime.h>
+#endif
 
 #include "../torch_utils.h"
 #include "../../cuda_compat.h"
 
 namespace {
 
+#ifdef USE_ROCM
+// CDNA has no cp.async, so the copy is synchronous and the commit/wait pair is
+// vacuous. Correctness does not depend on the asynchrony: the chunk loop's
+// __syncthreads() already orders the previous chunk's reads before this chunk's
+// writes, and the two stages are separate buffers. What is lost is the overlap of
+// the state load with compute, not the result.
+template <typename StateT>
+__device__ __forceinline__ void cp_async_16b(StateT* smem_ptr,
+                                             const StateT* gmem_ptr) {
+  *reinterpret_cast<float4*>(smem_ptr) =
+      *reinterpret_cast<const float4*>(gmem_ptr);
+}
+
+__device__ __forceinline__ void cp_async_commit() {}
+
+__device__ __forceinline__ void cp_async_wait_all() { __builtin_amdgcn_s_waitcnt(0); }
+#else
 template <typename StateT>
 __device__ __forceinline__ void cp_async_16b(StateT* smem_ptr,
                                              const StateT* gmem_ptr) {
@@ -31,6 +66,7 @@ __device__ __forceinline__ void cp_async_commit() {
 __device__ __forceinline__ void cp_async_wait_all() {
   asm volatile("cp.async.wait_all;\n" ::: "memory");
 }
+#endif
 
 template <typename StateT, int ChunkV, int DimK, int Stages>
 __device__ __forceinline__ void copy_state_chunk(StateT* shared_state,
@@ -82,6 +118,21 @@ __device__ __forceinline__ void store_state4<__nv_bfloat16>(
       __floats2bfloat162_rn(value.z, value.w);
 }
 
+// The kernel's "warp" is a logical 32-lane group (lane = tid & 31), which on CDNA2
+// is half a wave64. Every shuffle must therefore be width-limited to 32, or the
+// reductions silently fold two logical warps together and the lane-0 broadcast
+// hands warp 1 warp 0's scale factors. This is exactly what a bare hipify gets
+// wrong, so spell the width out on both backends.
+#ifdef USE_ROCM
+  #define GDN_SHFL_XOR_32(var, lane_mask) __shfl_xor((var), (lane_mask), 32)
+  #define GDN_SHFL_32(var, src_lane) __shfl((var), (src_lane), 32)
+#else
+  #define GDN_SHFL_XOR_32(var, lane_mask) \
+    __shfl_xor_sync(0xffffffffu, (var), (lane_mask), 32)
+  #define GDN_SHFL_32(var, src_lane) \
+    __shfl_sync(0xffffffffu, (var), (src_lane), 32)
+#endif
+
 constexpr int kDimK = 128;
 constexpr int kDimV = 128;
 constexpr int kThreads = 256;
@@ -128,7 +179,7 @@ __device__ __forceinline__ float load_dt_bias(const void* dt_bias, int head,
 __device__ __forceinline__ float warp_reduce_sum(float value) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    value += __shfl_xor_sync(0xffffffffu, value, offset);
+    value = GDN_SHFL_XOR_32(value, offset) + value;
   }
   return value;
 }
@@ -141,14 +192,22 @@ struct Sum2 {
 __device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    x += __shfl_xor_sync(0xffffffffu, x, offset);
-    y += __shfl_xor_sync(0xffffffffu, y, offset);
+    x = GDN_SHFL_XOR_32(x, offset) + x;
+    y = GDN_SHFL_XOR_32(y, offset) + y;
   }
   return {x, y};
 }
 
 template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate>
+// NOTE: on CUDA the second __launch_bounds__ argument is min blocks per SM; on HIP
+// it is min waves per EU. Rather than assert a different constraint, let the ROCm
+// compiler pick. (A CDNA2 CU has 64 KB of LDS against an SM's 164 KB+, so 2 resident
+// blocks is not reachable here anyway -- see kMaxMtpTokens.)
+#ifdef USE_ROCM
+__global__ __launch_bounds__(kThreads) void gdn_decode_post_conv_mtp_kernel(
+#else
 __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
+#endif
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
     const float* __restrict__ a_log, const void* __restrict__ dt_bias,
@@ -188,7 +247,7 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
   }
 
   const int key_head = value_head / ValueHeadsPerKeyHead;
-  __shared__ StateT shared_state[2][kChunkV][kDimK];
+  __shared__ __align__(16) StateT shared_state[2][kChunkV][kDimK];
   __shared__ float shared_q[kMaxMtpTokens][kDimK];
   __shared__ float shared_k[kMaxMtpTokens][kDimK];
   __shared__ __nv_bfloat16 shared_v[kMaxMtpTokens][kDimV];
@@ -223,10 +282,10 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
       k_square += k_values[i] * k_values[i];
     }
     const Sum2 qk_sums = warp_reduce_sum_pair(q_square, k_square);
-    const float q_scale = __shfl_sync(
-        0xffffffffu, lane == 0 ? rsqrtf(qk_sums.x + 1.0e-6f) * scale : 0.0f, 0);
-    const float k_scale = __shfl_sync(
-        0xffffffffu, lane == 0 ? rsqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
+    const float q_scale =
+        GDN_SHFL_32(lane == 0 ? rsqrtf(qk_sums.x + 1.0e-6f) * scale : 0.0f, 0);
+    const float k_scale =
+        GDN_SHFL_32(lane == 0 ? rsqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int dim = lane + i * 32;

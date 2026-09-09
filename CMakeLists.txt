@@ -1199,6 +1199,23 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     endif()
   endif()
 
+  # The fused GDN decode kernel is plain SIMT -- no tensor cores, no cp.async on the
+  # ROCm path -- so the same source builds for CDNA; see the USE_ROCM branches in it.
+  # Limited to CDNA (gfx90a/gfx942/gfx950) because the kernel decomposes its block into
+  # LOGICAL 32-lane warps and the ROCm path pins every shuffle to width 32 to match;
+  # that is validated on wave64, not on RDNA's wave32.
+  if(VLLM_GPU_LANG STREQUAL "HIP")
+    set(FUSED_GDN_DECODE_HIP_ARCHS ${VLLM_GPU_ARCHES})
+    list(FILTER FUSED_GDN_DECODE_HIP_ARCHS INCLUDE REGEX "gfx90a|gfx942|gfx950")
+    if(FUSED_GDN_DECODE_HIP_ARCHS)
+      set(FUSED_GDN_DECODE_HIP_SRC
+        "csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu")
+      list(APPEND VLLM_STABLE_EXT_SRC "${FUSED_GDN_DECODE_HIP_SRC}")
+      message(STATUS
+        "Building fused GDN decode for HIP archs: ${FUSED_GDN_DECODE_HIP_ARCHS}")
+    endif()
+  endif()
+
   message(STATUS "Enabling C_stable extension.")
   list(REMOVE_DUPLICATES VLLM_STABLE_EXT_SRC)
   define_extension_target(
@@ -1246,6 +1263,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(FUSED_KDA_DECODE_HIP_SRC)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_FUSED_KDA_DECODE=1)
+    endif()
+    if(FUSED_GDN_DECODE_HIP_SRC)
+      target_compile_definitions(_C_stable_libtorch PRIVATE
+        VLLM_ENABLE_FUSED_GDN_DECODE=1)
     endif()
   endif()
 
